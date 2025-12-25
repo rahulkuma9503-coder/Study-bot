@@ -1,3 +1,4 @@
+from typing import Dict
 from datetime import datetime, timedelta, date
 from typing import List, Dict, Optional, Tuple
 from pymongo import MongoClient, ASCENDING, DESCENDING
