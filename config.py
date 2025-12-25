@@ -32,7 +32,8 @@ class Config:
         '/myday',
         '/extend',
         '/setlimit',
-        '/help'
+        '/help',
+        '/start'
     ]
     
     # Group settings
