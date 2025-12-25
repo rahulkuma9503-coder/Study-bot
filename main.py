@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 from datetime import datetime, date, time, timedelta
-from typing import Optional
+from typing import Optional, Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
