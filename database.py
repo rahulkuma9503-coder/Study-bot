@@ -1,4 +1,3 @@
-
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -8,14 +7,13 @@ import config
 
 class MongoDB:
     def __init__(self):
-        self.client = MongoClient(config.Config.MONGODB_URI)
+        self.client = MongoClient(config.Config.MONGODB_URI, serverSelectionTimeoutMS=5000)
         self.db = self.client.study_bot
         
         # Collections
         self.users = self.db.users
         self.targets = self.db.targets
         self.dayoffs = self.db.dayoffs
-        self.messages = self.db.messages
         self.settings = self.db.settings
         
         self._create_indexes()
@@ -27,22 +25,11 @@ class MongoDB:
         self.users.create_index([("registered", ASCENDING)])
         
         # Targets collection indexes
-        self.targets.create_index([("user_id", ASCENDING), ("date", DESCENDING)], unique=True)
+        self.targets.create_index([("user_id", ASCENDING), ("date", ASCENDING)], unique=True)
         self.targets.create_index([("status", ASCENDING)])
-        self.targets.create_index([("date", DESCENDING)])
         
         # Dayoffs collection indexes
-        self.dayoffs.create_index([("user_id", ASCENDING), ("date", DESCENDING)], unique=True)
-        
-        # Messages collection indexes
-        self.messages.create_index([("user_id", ASCENDING), ("date", DESCENDING)])
-        
-        # Settings collection
-        self.settings.create_index([("group_id", ASCENDING)], unique=True)
-    
-    def get_today_date(self):
-        """Get today's date as string for MongoDB storage"""
-        return datetime.now().date()
+        self.dayoffs.create_index([("user_id", ASCENDING), ("date", ASCENDING)], unique=True)
     
     # User Management
     def add_user(self, user_id: int, username: str, first_name: str, group_id: int) -> bool:
@@ -88,7 +75,7 @@ class MongoDB:
     
     def update_daily_message_count(self, user_id: int) -> Tuple[int, int]:
         """Update message count for today, returns (current_count, limit)"""
-        today = self.get_today_date()
+        today = datetime.now().date()
         user = self.get_user(user_id)
         
         if not user:
@@ -129,13 +116,6 @@ class MongoDB:
             {"$set": {"daily_message_limit": limit}},
             upsert=True
         )
-        
-        # Update all users in the group with new default limit
-        if result.upserted_id or result.modified_count > 0:
-            self.users.update_many(
-                {"group_id": group_id, "daily_limit": config.Config.DEFAULT_DAILY_MESSAGE_LIMIT},
-                {"$set": {"daily_limit": limit}}
-            )
         return True
     
     def reset_daily_counts(self):
@@ -148,7 +128,7 @@ class MongoDB:
     # Target Management
     def add_target(self, user_id: int, target_text: str, image_id: str = None) -> bool:
         """Add target for today"""
-        today = self.get_today_date()
+        today = datetime.now().date()
         
         try:
             target_data = {
@@ -158,16 +138,9 @@ class MongoDB:
                 "image_id": image_id,
                 "status": "pending",
                 "created_at": datetime.now(),
-                "completed_at": None,
-                "updated_at": datetime.now()
+                "completed_at": None
             }
             self.targets.insert_one(target_data)
-            
-            # Reset consecutive absence on target submission
-            self.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"consecutive_absence": 0}}
-            )
             return True
         except DuplicateKeyError:
             # Update existing target
@@ -183,33 +156,24 @@ class MongoDB:
     
     def complete_target(self, user_id: int) -> bool:
         """Mark today's target as completed"""
-        today = self.get_today_date()
+        today = datetime.now().date()
         result = self.targets.update_one(
             {"user_id": user_id, "date": today},
             {"$set": {
                 "status": "completed",
-                "completed_at": datetime.now(),
-                "updated_at": datetime.now()
+                "completed_at": datetime.now()
             }}
         )
         return result.modified_count > 0
     
     def get_today_target(self, user_id: int) -> Optional[Dict]:
-        today = self.get_today_date()
+        today = datetime.now().date()
         return self.targets.find_one({"user_id": user_id, "date": today})
-    
-    def get_user_targets(self, user_id: int, days: int = 7) -> List[Dict]:
-        """Get user's targets for last N days"""
-        start_date = datetime.now().date() - timedelta(days=days)
-        return list(self.targets.find({
-            "user_id": user_id,
-            "date": {"$gte": start_date}
-        }).sort("date", DESCENDING))
     
     # Day Off Management
     def add_dayoff(self, user_id: int, reason: str) -> bool:
         """Mark today as day off"""
-        today = self.get_today_date()
+        today = datetime.now().date()
         
         try:
             dayoff_data = {
@@ -219,24 +183,18 @@ class MongoDB:
                 "created_at": datetime.now()
             }
             self.dayoffs.insert_one(dayoff_data)
-            
-            # Reset consecutive absence on day off
-            self.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"consecutive_absence": 0}}
-            )
             return True
         except DuplicateKeyError:
             return False
     
     def has_dayoff_today(self, user_id: int) -> bool:
-        today = self.get_today_date()
+        today = datetime.now().date()
         return self.dayoffs.find_one({"user_id": user_id, "date": today}) is not None
     
     # Statistics and Reminders
     def get_users_without_target_today(self, group_id: int) -> List[Dict]:
         """Get registered users who haven't set target or taken day off today"""
-        today = self.get_today_date()
+        today = datetime.now().date()
         
         # Get all registered users in group
         all_users = list(self.users.find({
@@ -275,53 +233,38 @@ class MongoDB:
             "consecutive_absence": {"$gte": limit}
         }))
     
-    def reset_absence(self, user_id: int):
-        """Reset consecutive absence count"""
-        self.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"consecutive_absence": 0}}
-        )
-    
     # Leaderboard
     def get_leaderboard(self, group_id: int, days: int = 30) -> List[Dict]:
         """Get leaderboard based on completed targets"""
         start_date = datetime.now().date() - timedelta(days=days)
         
-        pipeline = [
-            {
-                "$match": {
-                    "date": {"$gte": start_date},
-                    "status": "completed"
-                }
-            },
-            {
-                "$lookup": {
-                    "from": "users",
-                    "localField": "user_id",
-                    "foreignField": "user_id",
-                    "as": "user_info"
-                }
-            },
-            {"$unwind": "$user_info"},
-            {
-                "$match": {
-                    "user_info.group_id": group_id,
-                    "user_info.registered": True
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$user_id",
-                    "completed_targets": {"$sum": 1},
-                    "username": {"$first": "$user_info.username"},
-                    "first_name": {"$first": "$user_info.first_name"}
-                }
-            },
-            {"$sort": {"completed_targets": DESCENDING}},
-            {"$limit": 20}
-        ]
+        # Get all completed targets in date range
+        completed_targets = list(self.targets.find({
+            "date": {"$gte": start_date},
+            "status": "completed"
+        }))
         
-        return list(self.targets.aggregate(pipeline))
+        # Group by user
+        user_stats = {}
+        for target in completed_targets:
+            user_id = target["user_id"]
+            if user_id not in user_stats:
+                user_stats[user_id] = 0
+            user_stats[user_id] += 1
+        
+        # Get user info and filter by group
+        leaderboard = []
+        for user_id, completed_count in sorted(user_stats.items(), key=lambda x: x[1], reverse=True)[:20]:
+            user = self.get_user(user_id)
+            if user and user.get("group_id") == group_id and user.get("registered"):
+                leaderboard.append({
+                    "user_id": user_id,
+                    "completed_targets": completed_count,
+                    "username": user.get("username"),
+                    "first_name": user.get("first_name")
+                })
+        
+        return leaderboard
     
     def get_user_stats(self, user_id: int, days: int = 30) -> Dict:
         """Get user statistics"""
@@ -347,24 +290,15 @@ class MongoDB:
         active_days = total_days - dayoff_count
         completion_rate = (completed / active_days * 100) if active_days > 0 else 0
         
-        # Current streak
-        today = datetime.now().date()
+        # Current streak (simplified)
         streak = 0
-        current_date = today
-        
-        while True:
-            # Check if target exists and is completed
-            target = self.targets.find_one({"user_id": user_id, "date": current_date})
-            if target and target.get("status") == "completed":
+        for i in range(days):
+            check_date = datetime.now().date() - timedelta(days=i)
+            target = self.targets.find_one({"user_id": user_id, "date": check_date, "status": "completed"})
+            if target:
                 streak += 1
-                current_date = current_date - timedelta(days=1)
             else:
-                # Check if day off
-                if self.dayoffs.find_one({"user_id": user_id, "date": current_date}):
-                    streak += 1
-                    current_date = current_date - timedelta(days=1)
-                else:
-                    break
+                break
         
         return {
             "completed_targets": completed,
@@ -378,12 +312,6 @@ class MongoDB:
     # Admin Functions
     def get_all_users(self, group_id: int) -> List[Dict]:
         return list(self.users.find({"group_id": group_id}).sort("joined_at", DESCENDING))
-    
-    def get_group_settings(self, group_id: int) -> Dict:
-        settings = self.settings.find_one({"group_id": group_id})
-        if not settings:
-            return {"daily_message_limit": config.Config.DEFAULT_DAILY_MESSAGE_LIMIT}
-        return settings
     
     def close(self):
         self.client.close()
