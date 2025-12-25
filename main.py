@@ -9,8 +9,6 @@ from telegram.ext import (
     ContextTypes, filters
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
-
 import config
 from database import MongoDB
 from utils import Utils
@@ -27,10 +25,10 @@ logging.basicConfig(
 
 # Helper functions
 def is_admin(user_id: int) -> bool:
-    return user_id == config.Config.ADMIN_USER_ID
+    return str(user_id) == str(config.Config.ADMIN_USER_ID)
 
 def is_allowed_group(chat_id: int) -> bool:
-    return chat_id == config.Config.ALLOWED_GROUP_ID
+    return str(chat_id) == str(config.Config.ALLOWED_GROUP_ID)
 
 def is_command_exempt(text: str) -> bool:
     """Check if message is a command that should be exempt from daily limit"""
@@ -193,171 +191,141 @@ async def check_message_limit(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    try:
-        user = update.effective_user
-        
-        if update.message.chat.type == "private":  # DM
-            if context.args and context.args[0] == "register":
-                # Check if already registered
-                if db.is_user_registered(user.id):
-                    await update.message.reply_text(
-                        "✅ You are already registered!\n"
-                        "You can now participate in the group."
-                    )
-                    return
-                
-                # Send declaration
+    user = update.effective_user
+    
+    if update.message.chat.type == "private":  # DM
+        if context.args and context.args[0] == "register":
+            # Check if already registered
+            if db.is_user_registered(user.id):
                 await update.message.reply_text(
-                    Utils.get_declaration_text(),
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=Utils.create_registration_keyboard()
-                )
-            else:
-                await update.message.reply_text(
-                    "🤖 *Study Bot Commands*\n\n"
-                    "In group:\n"
-                    "/mytarget - Set today's target (reply to message with image)\n"
-                    "/complete - Mark today's target as completed\n"
-                    "/addoff <reason> - Mark today as day off\n"
-                    "/leaderboard - View top performers\n"
-                    "/progress - View your statistics\n"
-                    "/myday - View today's target\n\n"
-                    "In DM:\n"
-                    "Use /start register to begin registration",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-        else:  # Group chat
-            if is_allowed_group(update.effective_chat.id):
-                await update.message.reply_text(
-                    "🤖 *Study Bot is active!*\n\n"
-                    "Available commands:\n"
-                    "/mytarget - Set today's target\n"
-                    "/complete - Mark target completed\n"
-                    "/addoff <reason> - Take day off\n"
-                    "/leaderboard - View rankings\n"
-                    "/progress - Your statistics\n"
-                    "/myday - Today's target\n"
-                    "/help - Show all commands",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-    except Exception as e:
-        logger.error(f"Error in start command: {e}")
-        await update.message.reply_text(
-            "❌ An error occurred. Please try again.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new members joining the group"""
-    try:
-        chat = update.effective_chat
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        for new_member in update.message.new_chat_members:
-            # Skip if bot itself
-            if new_member.id == context.bot.id:
-                continue
-            
-            # Check if user already exists
-            existing_user = db.get_user(new_member.id)
-            
-            if not existing_user:
-                # Add user to database
-                db.add_user(
-                    user_id=new_member.id,
-                    username=new_member.username,
-                    first_name=new_member.first_name,
-                    group_id=chat.id
-                )
-            
-            # Send welcome message and restrict
-            await send_welcome_and_restrict(update, context, new_member)
-    except Exception as e:
-        logger.error(f"Error in handle_new_chat_members: {e}")
-
-async def mytarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mytarget command"""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Check if user is registered
-        if not db.is_user_registered(user.id):
-            keyboard = [[InlineKeyboardButton(
-                "📝 Register Now",
-                url=f"https://t.me/{context.bot.username}?start=register"
-            )]]
-            
-            await update.message.reply_text(
-                "⚠️ Please register first by clicking the button below.",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-        
-        # Get target text
-        target_text = ""
-        
-        # If replying to a message
-        if update.message.reply_to_message:
-            # Check if replying to an image
-            if update.message.reply_to_message.photo:
-                # Use caption if available
-                if update.message.reply_to_message.caption:
-                    target_text = update.message.reply_to_message.caption
-                # Or use command arguments
-                elif context.args:
-                    target_text = " ".join(context.args)
-                else:
-                    await update.message.reply_text(
-                        "Please provide target text.\n"
-                        "Example: Reply to image with `/mytarget Studying this diagram`",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    return
-            else:
-                # Reply to text message
-                if update.message.reply_to_message.text:
-                    target_text = update.message.reply_to_message.text
-                elif context.args:
-                    target_text = " ".join(context.args)
-                else:
-                    target_text = "Target set via reply"
-        else:
-            # Not replying to anything, use command arguments
-            if not context.args:
-                await update.message.reply_text(
-                    "📝 *How to set target:*\n\n"
-                    "1. Send your target as text:\n"
-                    "   `/mytarget Complete chapter 5 of Physics`\n\n"
-                    "2. Or reply to an image with target text:\n"
-                    "   Reply to image with `/mytarget Working on this diagram`\n\n"
-                    "3. Or reply to a text message to use it as target\n\n"
-                    "Example: `/mytarget Study Python for 2 hours`",
-                    parse_mode=ParseMode.MARKDOWN
+                    "✅ You are already registered!\n"
+                    "You can now participate in the group."
                 )
                 return
             
-            target_text = " ".join(context.args)
-        
-        if not target_text.strip():
+            # Send declaration
             await update.message.reply_text(
-                "Please provide target text.\n"
-                "Example: `/mytarget Study calculus chapter 3`",
+                Utils.get_declaration_text(),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=Utils.create_registration_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "🤖 *Study Bot Commands*\n\n"
+                "In group:\n"
+                "/mytarget - Set today's target (reply to message with image)\n"
+                "/complete - Mark today's target as completed\n"
+                "/addoff <reason> - Mark today as day off\n"
+                "/leaderboard - View top performers\n"
+                "/progress - View your statistics\n"
+                "/myday - View today's target\n\n"
+                "In DM:\n"
+                "Use /start register to begin registration",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    else:  # Group chat
+        if is_allowed_group(update.effective_chat.id):
+            await update.message.reply_text(
+                "🤖 *Study Bot is active!*\n\n"
+                "Available commands:\n"
+                "/mytarget - Set today's target\n"
+                "/complete - Mark target completed\n"
+                "/addoff <reason> - Take day off\n"
+                "/leaderboard - View rankings\n"
+                "/progress - Your statistics\n"
+                "/myday - Today's target\n"
+                "/help - Show all commands",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new members joining the group"""
+    chat = update.effective_chat
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    for new_member in update.message.new_chat_members:
+        # Skip if bot itself
+        if new_member.id == context.bot.id:
+            continue
+        
+        # Check if user already exists
+        existing_user = db.get_user(new_member.id)
+        
+        if not existing_user:
+            # Add user to database
+            db.add_user(
+                user_id=new_member.id,
+                username=new_member.username,
+                first_name=new_member.first_name,
+                group_id=chat.id
+            )
+        
+        # Send welcome message and restrict
+        await send_welcome_and_restrict(update, context, new_member)
+
+async def mytarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /mytarget command"""
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Check if user is registered
+    if not db.is_user_registered(user.id):
+        keyboard = [[InlineKeyboardButton(
+            "📝 Register Now",
+            url=f"https://t.me/{context.bot.username}?start=register"
+        )]]
+        
+        await update.message.reply_text(
+            "⚠️ Please register first by clicking the button below.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    # Get target text from command arguments
+    if not context.args:
+        # Check if replying to a message
+        if update.message.reply_to_message:
+            # Get text from replied message
+            if update.message.reply_to_message.caption:
+                target_text = update.message.reply_to_message.caption
+            elif update.message.reply_to_message.text:
+                target_text = update.message.reply_to_message.text
+            else:
+                target_text = ""
+        else:
+            await update.message.reply_text(
+                "📝 *How to set target:*\n\n"
+                "1. Type your target after the command:\n"
+                "   `/mytarget Complete chapter 5 of Physics`\n\n"
+                "2. Or reply to an image with the command:\n"
+                "   Reply to image with `/mytarget`\n\n"
+                "3. Or reply to a text message with the command",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        
-        # Get image if available (from replied message)
-        image_id = None
-        if update.message.reply_to_message and update.message.reply_to_message.photo:
-            image_id = update.message.reply_to_message.photo[-1].file_id
-        
-        # Save target
+    else:
+        target_text = " ".join(context.args)
+    
+    if not target_text.strip():
+        await update.message.reply_text(
+            "Please provide target text.\n"
+            "Example: `/mytarget Study calculus chapter 3`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Get image if available (from replied message)
+    image_id = None
+    if update.message.reply_to_message and update.message.reply_to_message.photo:
+        image_id = update.message.reply_to_message.photo[-1].file_id
+    
+    # Save target
+    try:
         success = db.add_target(user.id, target_text, image_id)
         
         if success:
@@ -384,373 +352,333 @@ async def mytarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in mytarget command: {e}")
         await update.message.reply_text(
-            "❌ Error setting target. Please check the format and try again.",
+            "❌ Error setting target. Please try again.",
             parse_mode=ParseMode.MARKDOWN
         )
 
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /complete command"""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Check if user is registered
-        if not db.is_user_registered(user.id):
-            await update.message.reply_text(
-                "⚠️ Please register first. Use /start in DM to register.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Check if user has target for today
-        target = db.get_today_target(user.id)
-        if not target:
-            await update.message.reply_text(
-                "📝 You haven't set a target for today!\n"
-                "Use `/mytarget` to set one first.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Mark as completed
-        success = db.complete_target(user.id)
-        
-        if success:
-            await chat.send_message(
-                f"🎉 *Target Completed!*\n\n"
-                f"✅ {user.mention_html()} has completed today's target!\n"
-                f"📌 Target: {target.get('target', 'No target')}\n"
-                f"🕐 Time: {datetime.now().strftime('%H:%M')}",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Failed to mark as completed. You may not have a target today.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    except Exception as e:
-        logger.error(f"Error in complete command: {e}")
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Check if user is registered
+    if not db.is_user_registered(user.id):
         await update.message.reply_text(
-            "❌ Error completing target. Please try again.",
+            "⚠️ Please register first. Use /start in DM to register.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Check if user has target for today
+    target = db.get_today_target(user.id)
+    if not target:
+        await update.message.reply_text(
+            "📝 You haven't set a target for today!\n"
+            "Use `/mytarget` to set one first.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Mark as completed
+    success = db.complete_target(user.id)
+    
+    if success:
+        await chat.send_message(
+            f"🎉 *Target Completed!*\n\n"
+            f"✅ {user.mention_html()} has completed today's target!\n"
+            f"📌 Target: {target.get('target', 'No target')}\n"
+            f"🕐 Time: {datetime.now().strftime('%H:%M')}",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Failed to mark as completed. You may not have a target today.",
             parse_mode=ParseMode.MARKDOWN
         )
 
 async def addoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addoff command"""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Check if user is registered
-        if not db.is_user_registered(user.id):
-            await update.message.reply_text(
-                "⚠️ Please register first. Use /start in DM to register.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Check reason
-        reason = " ".join(context.args) if context.args else "Personal reasons"
-        
-        if len(reason) > 100:
-            await update.message.reply_text(
-                "Reason too long. Please keep it under 100 characters.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Add day off
-        success = db.add_dayoff(user.id, reason)
-        
-        if success:
-            await chat.send_message(
-                f"🌴 *Day Off Added*\n\n"
-                f"{user.mention_html()} is taking a day off.\n"
-                f"📝 Reason: {reason}\n"
-                f"📅 Date: {datetime.now().strftime('%Y-%m-%d')}",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await update.message.reply_text(
-                "❌ You've already marked today as day off.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    except Exception as e:
-        logger.error(f"Error in addoff command: {e}")
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Check if user is registered
+    if not db.is_user_registered(user.id):
         await update.message.reply_text(
-            "❌ Error adding day off. Please try again.",
+            "⚠️ Please register first. Use /start in DM to register.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Check reason
+    reason = " ".join(context.args) if context.args else "Personal reasons"
+    
+    if len(reason) > 100:
+        await update.message.reply_text(
+            "Reason too long. Please keep it under 100 characters.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Check if already has target for today
+    existing_target = db.get_today_target(user.id)
+    if existing_target:
+        await update.message.reply_text(
+            "⚠️ You already have a target set for today.\n"
+            "Complete it first with `/complete` or update it with `/mytarget`.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Add day off
+    success = db.add_dayoff(user.id, reason)
+    
+    if success:
+        await chat.send_message(
+            f"🌴 *Day Off Added*\n\n"
+            f"{user.mention_html()} is taking a day off.\n"
+            f"📝 Reason: {reason}\n"
+            f"📅 Date: {datetime.now().strftime('%Y-%m-%d')}",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(
+            "❌ You've already marked today as day off.",
             parse_mode=ParseMode.MARKDOWN
         )
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /leaderboard command"""
-    try:
-        chat = update.effective_chat
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Get leaderboard
-        leaderboard_data = db.get_leaderboard(chat.id)
-        
-        # Format message
-        message = Utils.create_leaderboard_message(leaderboard_data)
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        logger.error(f"Error in leaderboard command: {e}")
-        await update.message.reply_text(
-            "❌ Error loading leaderboard. Please try again later.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    chat = update.effective_chat
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Get leaderboard
+    leaderboard_data = db.get_leaderboard(chat.id)
+    
+    # Format message
+    message = Utils.create_leaderboard_message(leaderboard_data)
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /progress command"""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Check if user is registered
-        if not db.is_user_registered(user.id):
-            await update.message.reply_text(
-                "⚠️ Please register first. Use /start in DM to register.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Get user stats
-        user_info = db.get_user(user.id)
-        stats = db.get_user_stats(user.id)
-        
-        # Format message
-        message = Utils.create_stats_message(stats, user_info)
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        logger.error(f"Error in progress command: {e}")
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Check if user is registered
+    if not db.is_user_registered(user.id):
         await update.message.reply_text(
-            "❌ Error loading progress. Please try again later.",
+            "⚠️ Please register first. Use /start in DM to register.",
             parse_mode=ParseMode.MARKDOWN
         )
+        return
+    
+    # Get user stats
+    user_info = db.get_user(user.id)
+    stats = db.get_user_stats(user.id)
+    
+    # Format message
+    message = Utils.create_stats_message(stats, user_info)
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
 async def myday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /myday command"""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Check if user is registered
-        if not db.is_user_registered(user.id):
-            await update.message.reply_text(
-                "⚠️ Please register first. Use /start in DM to register.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Check today's target
-        target = db.get_today_target(user.id)
-        
-        if target:
-            message = Utils.format_target_message(target, db.get_user(user.id))
-            
-            # Send with image if available
-            if target.get("image_id"):
-                await chat.send_photo(
-                    photo=target["image_id"],
-                    caption=message,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-        else:
-            # Check if day off
-            if db.has_dayoff_today(user.id):
-                await update.message.reply_text(
-                    "🌴 You have marked today as day off.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await update.message.reply_text(
-                    "📝 You haven't set a target for today!\n"
-                    "Use `/mytarget` to set your target.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-    except Exception as e:
-        logger.error(f"Error in myday command: {e}")
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Check if user is registered
+    if not db.is_user_registered(user.id):
         await update.message.reply_text(
-            "❌ Error loading today's target. Please try again.",
+            "⚠️ Please register first. Use /start in DM to register.",
             parse_mode=ParseMode.MARKDOWN
         )
+        return
+    
+    # Check today's target
+    target = db.get_today_target(user.id)
+    
+    if target:
+        message = Utils.format_target_message(target, db.get_user(user.id))
+        
+        # Send with image if available
+        if target.get("image_id"):
+            await chat.send_photo(
+                photo=target["image_id"],
+                caption=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    else:
+        # Check if day off
+        if db.has_dayoff_today(user.id):
+            await update.message.reply_text(
+                "🌴 You have marked today as day off.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "📝 You haven't set a target for today!\n"
+                "Use `/mytarget` to set your target.",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
 async def extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /extend command (admin only)"""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Check if admin
-        if not is_admin(user.id):
-            await update.message.reply_text(
-                "❌ This command is for admins only.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Check arguments
-        if len(context.args) != 2:
-            await update.message.reply_text(
-                "Usage: `/extend @username 10`\n"
-                "Or: `/extend user_id 10`\n\n"
-                "Example: `/extend @john 5` - extends by 5 messages",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        try:
-            target_user_ref = context.args[0]
-            additional_messages = int(context.args[1])
-            
-            if additional_messages <= 0 or additional_messages > 100:
-                await update.message.reply_text(
-                    "❌ Number must be between 1 and 100.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            
-            # Find user
-            target_user = None
-            
-            # Check if it's a user ID
-            if target_user_ref.isdigit():
-                target_user = db.get_user(int(target_user_ref))
-            # Check if it's a mention
-            elif target_user_ref.startswith('@'):
-                username = target_user_ref[1:]  # Remove @
-                # Find by username
-                all_users = db.get_all_users(chat.id)
-                for u in all_users:
-                    if u.get('username') and u['username'].lower() == username.lower():
-                        target_user = u
-                        break
-            
-            if not target_user:
-                await update.message.reply_text(
-                    "❌ User not found.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            
-            # Extend limit
-            success = db.extend_user_limit(target_user['user_id'], additional_messages)
-            
-            if success:
-                new_limit = target_user.get('daily_limit', config.Config.DEFAULT_DAILY_MESSAGE_LIMIT) + additional_messages
-                await update.message.reply_text(
-                    f"✅ Extended {target_user.get('first_name', 'User')}'s "
-                    f"daily limit by {additional_messages} messages.\n"
-                    f"New daily limit: {new_limit}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ Failed to extend limit.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Invalid number format.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    except Exception as e:
-        logger.error(f"Error in extend command: {e}")
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Check if admin
+    if not is_admin(user.id):
         await update.message.reply_text(
-            "❌ Error extending limit. Please try again.",
+            "❌ This command is for admins only.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Check arguments
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: `/extend @username 10`\n"
+            "Or: `/extend user_id 10`\n\n"
+            "Example: `/extend @john 5` - extends by 5 messages",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    try:
+        target_user_ref = context.args[0]
+        additional_messages = int(context.args[1])
+        
+        if additional_messages <= 0 or additional_messages > 100:
+            await update.message.reply_text(
+                "❌ Number must be between 1 and 100.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Find user
+        target_user = None
+        
+        # Check if it's a user ID
+        if target_user_ref.isdigit():
+            target_user = db.get_user(int(target_user_ref))
+        # Check if it's a mention
+        elif target_user_ref.startswith('@'):
+            username = target_user_ref[1:]  # Remove @
+            # Find by username
+            all_users = db.get_all_users(chat.id)
+            for u in all_users:
+                if u.get('username') and u['username'].lower() == username.lower():
+                    target_user = u
+                    break
+        
+        if not target_user:
+            await update.message.reply_text(
+                "❌ User not found.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Extend limit
+        success = db.extend_user_limit(target_user['user_id'], additional_messages)
+        
+        if success:
+            new_limit = target_user.get('daily_limit', config.Config.DEFAULT_DAILY_MESSAGE_LIMIT) + additional_messages
+            await update.message.reply_text(
+                f"✅ Extended {target_user.get('first_name', 'User')}'s "
+                f"daily limit by {additional_messages} messages.\n"
+                f"New daily limit: {new_limit}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to extend limit.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid number format.",
             parse_mode=ParseMode.MARKDOWN
         )
 
 async def setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setlimit command (admin only)"""
-    try:
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Check if admin
-        if not is_admin(user.id):
-            await update.message.reply_text(
-                "❌ This command is for admins only.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Check arguments
-        if len(context.args) < 1:
-            await update.message.reply_text(
-                "Usage: `/setlimit 30`\n"
-                "Sets default daily message limit for all group members.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        try:
-            limit = int(context.args[0])
-            
-            if limit < 5 or limit > 200:
-                await update.message.reply_text(
-                    "❌ Limit must be between 5 and 200.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            
-            # Set limit
-            success = db.set_group_limit(chat.id, limit)
-            
-            if success:
-                await update.message.reply_text(
-                    f"✅ Default daily message limit set to {limit} for all users.\n"
-                    f"Existing users will have this limit on their next message.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ Failed to set limit.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Invalid number format.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    except Exception as e:
-        logger.error(f"Error in setlimit command: {e}")
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Check if admin
+    if not is_admin(user.id):
         await update.message.reply_text(
-            "❌ Error setting limit. Please try again.",
+            "❌ This command is for admins only.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Check arguments
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Usage: `/setlimit 30`\n"
+            "Sets default daily message limit for all group members.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    try:
+        limit = int(context.args[0])
+        
+        if limit < 5 or limit > 200:
+            await update.message.reply_text(
+                "❌ Limit must be between 5 and 200.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Set limit
+        success = db.set_group_limit(chat.id, limit)
+        
+        if success:
+            await update.message.reply_text(
+                f"✅ Default daily message limit set to {limit} for all users.\n"
+                f"Existing users will have this limit on their next message.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to set limit.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid number format.",
             parse_mode=ParseMode.MARKDOWN
         )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
-    try:
-        help_text = """
+    help_text = """
 🤖 *Study Bot Help Guide*
 
 📚 *For Everyone:*
@@ -775,220 +703,209 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Commands don't count towards message limit
 
 ❓ *Need Help?* Contact admin.
-        """
-        
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        logger.error(f"Error in help command: {e}")
+    """
+    
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_declaration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle declaration acceptance callback"""
-    try:
-        query = update.callback_query
-        await query.answer()
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    
+    if query.data == "accept_declaration":
+        # Register user
+        success = db.register_user(user.id)
         
-        user = query.from_user
-        
-        if query.data == "accept_declaration":
-            # Register user
-            success = db.register_user(user.id)
+        if success:
+            # Unrestrict user in group
+            await unrestrict_user_in_group(context, user.id)
             
-            if success:
-                # Unrestrict user in group
-                await unrestrict_user_in_group(context, user.id)
-                
-                await query.edit_message_text(
-                    "✅ *Registration Successful!*\n\n"
-                    "You can now participate in the study group.\n"
-                    f"Return to group: {config.Config.GROUP_LINK}\n\n"
-                    "*Remember:*\n"
-                    "• Set daily targets with `/mytarget`\n"
-                    "• Mark completed with `/complete`\n"
-                    "• Use `/addoff` when taking breaks\n"
-                    "• Daily message limit: 20\n"
-                    "• Have fun learning! 🎓",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                # Send welcome message to group
-                try:
-                    await context.bot.send_message(
-                        chat_id=config.Config.ALLOWED_GROUP_ID,
-                        text=f"👋 Welcome {user.mention_html()} to the study group! 🎉",
-                        parse_mode=ParseMode.HTML
-                    )
-                except:
-                    pass
-            else:
-                await query.edit_message_text(
-                    "❌ Registration failed. Please try again or contact admin."
-                )
-        else:  # decline
             await query.edit_message_text(
-                "❌ Registration declined.\n"
-                "You must accept the declaration to join the study group."
+                "✅ *Registration Successful!*\n\n"
+                "You can now participate in the study group.\n"
+                f"Return to group: {config.Config.GROUP_LINK}\n\n"
+                "*Remember:*\n"
+                "• Set daily targets with `/mytarget`\n"
+                "• Mark completed with `/complete`\n"
+                "• Use `/addoff` when taking breaks\n"
+                "• Daily message limit: 20\n"
+                "• Have fun learning! 🎓",
+                parse_mode=ParseMode.MARKDOWN
             )
-    except Exception as e:
-        logger.error(f"Error in handle_declaration_callback: {e}")
+            
+            # Send welcome message to group
+            try:
+                await context.bot.send_message(
+                    chat_id=config.Config.ALLOWED_GROUP_ID,
+                    text=f"👋 Welcome {user.mention_html()} to the study group! 🎉",
+                    parse_mode=ParseMode.HTML
+                )
+            except:
+                pass
+        else:
+            await query.edit_message_text(
+                "❌ Registration failed. Please try again or contact admin."
+            )
+    else:  # decline
+        await query.edit_message_text(
+            "❌ Registration declined.\n"
+            "You must accept the declaration to join the study group."
+        )
 
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all messages to check limits and restrictions"""
-    try:
-        if not update.message:
-            return
-        
-        chat = update.effective_chat
-        user = update.effective_user
-        
-        # Only process group messages
-        if not is_allowed_group(chat.id):
-            return
-        
-        # Skip if message is from bot
-        if user.id == context.bot.id:
-            return
-        
-        # Get user data
+    if not update.message:
+        return
+    
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    # Only process group messages
+    if not is_allowed_group(chat.id):
+        return
+    
+    # Skip if message is from bot
+    if user.id == context.bot.id:
+        return
+    
+    # Get user data
+    user_data = db.get_user(user.id)
+    if not user_data:
+        # Add user if not exists (for manual adds or users who joined before bot)
+        db.add_user(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            group_id=chat.id
+        )
         user_data = db.get_user(user.id)
-        if not user_data:
-            # Add user if not exists (for manual adds or users who joined before bot)
-            db.add_user(
-                user_id=user.id,
-                username=user.username,
-                first_name=user.first_name,
-                group_id=chat.id
-            )
-            user_data = db.get_user(user.id)
+    
+    # Check if user is registered
+    if not user_data.get("registered", False):
+        # Check if message is a command that unregistered users can use
+        if update.message.text and update.message.text.startswith('/'):
+            cmd = update.message.text.split('@')[0] if '@' in update.message.text else update.message.text
+            if cmd in ['/start', '/help']:
+                return  # Allow these commands
         
-        # Check if user is registered
-        if not user_data.get("registered", False):
-            # Check if message is a command that unregistered users can use
-            if update.message.text and update.message.text.startswith('/'):
-                cmd = update.message.text.split('@')[0] if '@' in update.message.text else update.message.text
-                if cmd in ['/start', '/help']:
-                    return  # Allow these commands
+        # Delete message from unregistered user
+        try:
+            await update.message.delete()
             
-            # Delete message from unregistered user
-            try:
-                await update.message.delete()
+            # Send warning only once every 2 minutes per user
+            user_key = f"last_warning_{user.id}"
+            last_warning = context.user_data.get(user_key, datetime.min)
+            if (datetime.now() - last_warning).total_seconds() > 120:  # 2 minutes
+                keyboard = [[InlineKeyboardButton(
+                    "📝 Register Now",
+                    url=f"https://t.me/{context.bot.username}?start=register"
+                )]]
                 
-                # Send warning only once every 2 minutes per user
-                user_key = f"last_warning_{user.id}"
-                last_warning = context.user_data.get(user_key, datetime.min)
-                if (datetime.now() - last_warning).total_seconds() > 120:  # 2 minutes
-                    keyboard = [[InlineKeyboardButton(
-                        "📝 Register Now",
-                        url=f"https://t.me/{context.bot.username}?start=register"
-                    )]]
-                    
-                    warning_msg = (
-                        f"⚠️ {user.mention_html()}, please register first!\n"
-                        f"Click the button below to register and accept the declaration."
-                    )
-                    await chat.send_message(
-                        warning_msg,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                    context.user_data[user_key] = datetime.now()
-            except Exception as e:
-                logger.error(f"Error handling unregistered user message: {e}")
-            return
-        
-        # User is registered, check daily message limit
-        if not await check_message_limit(update, context):
-            return
-    except Exception as e:
-        logger.error(f"Error in handle_all_messages: {e}")
+                warning_msg = (
+                    f"⚠️ {user.mention_html()}, please register first!\n"
+                    f"Click the button below to register and accept the declaration."
+                )
+                await chat.send_message(
+                    warning_msg,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                context.user_data[user_key] = datetime.now()
+        except Exception as e:
+            logger.error(f"Error handling unregistered user message: {e}")
+        return
+    
+    # User is registered, check daily message limit
+    if not await check_message_limit(update, context):
+        return
 
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Send reminders to users without targets"""
-    try:
-        job = context.job
+    job = context.job
+    
+    # Get users without targets today
+    users_without_target = db.get_users_without_target_today(config.Config.ALLOWED_GROUP_ID)
+    
+    for user in users_without_target:
+        user_id = user["user_id"]
         
-        # Get users without targets today
-        users_without_target = db.get_users_without_target_today(config.Config.ALLOWED_GROUP_ID)
+        try:
+            # Send reminder via DM
+            reminder_msg = (
+                "📢 *Daily Reminder*\n\n"
+                "You haven't set your study target for today!\n\n"
+                f"📍 Group: {config.Config.GROUP_LINK}\n"
+                "📝 Use `/mytarget` to set your target\n"
+                "🌴 Or `/addoff <reason>` if taking break\n"
+                "✅ Use `/complete` when done\n\n"
+                "*Warning:* 3 consecutive days without target may result in removal."
+            )
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=reminder_msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Update last reminder date
+            db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"last_reminder_date": datetime.now()}}
+            )
+            
+            # Increment absence count
+            db.increment_absence(user_id)
+            
+        except Exception as e:
+            logger.error(f"Failed to send reminder to {user_id}: {e}")
+            
+            # If can't send DM (user blocked bot), increment absence anyway
+            db.increment_absence(user_id)
+
+async def check_absent_users(context: ContextTypes.DEFAULT_TYPE):
+    """Check and warn/kick users with consecutive absences"""
+    job = context.job
+    
+    # Get users exceeding absence limit
+    absent_users = db.get_users_exceeding_absence_limit(
+        config.Config.ALLOWED_GROUP_ID,
+        config.Config.CONSECUTIVE_ABSENCE_LIMIT
+    )
+    
+    for user in absent_users:
+        user_id = user["user_id"]
+        consecutive_absence = user.get("consecutive_absence", 0)
         
-        for user in users_without_target:
-            user_id = user["user_id"]
-            
-            # Skip if already sent reminder today
-            last_reminder = user.get("last_reminder_date")
-            if last_reminder and last_reminder.date() == datetime.now().date():
-                continue
-            
+        # Send warning for 3 consecutive absences
+        if consecutive_absence == 3:
             try:
-                # Send reminder via DM
-                reminder_msg = (
-                    "📢 *Daily Reminder*\n\n"
-                    "You haven't set your study target for today!\n\n"
-                    f"📍 Group: {config.Config.GROUP_LINK}\n"
-                    "📝 Use `/mytarget` to set your target\n"
-                    "🌴 Or `/addoff <reason>` if taking break\n"
-                    "✅ Use `/complete` when done\n\n"
-                    "*Warning:* 3 consecutive days without target may result in removal."
+                warning_msg = (
+                    f"⚠️ *Warning*\n\n"
+                    f"You haven't set targets for {consecutive_absence} consecutive days.\n"
+                    f"Please set your target today or you may be removed from the group."
                 )
                 
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=reminder_msg,
+                    text=warning_msg,
                     parse_mode=ParseMode.MARKDOWN
                 )
                 
-                # Update last reminder date
-                db.users.update_one(
-                    {"user_id": user_id},
-                    {"$set": {"last_reminder_date": datetime.now()}}
-                )
-                
-                # Increment absence count
-                db.increment_absence(user_id)
+                logger.info(f"Sent warning to user {user_id} for {consecutive_absence} absences")
                 
             except Exception as e:
-                logger.error(f"Failed to send reminder to {user_id}: {e}")
-                
-                # If can't send DM (user blocked bot), increment absence anyway
-                db.increment_absence(user_id)
-    except Exception as e:
-        logger.error(f"Error in send_reminders: {e}")
+                logger.error(f"Failed to warn user {user_id}: {e}")
 
 async def reset_daily_counts_job(context: ContextTypes.DEFAULT_TYPE):
     """Reset daily message counts at midnight"""
-    try:
-        db.reset_daily_counts()
-        logger.info("Daily message counts reset")
-    except Exception as e:
-        logger.error(f"Error in reset_daily_counts_job: {e}")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    try:
-        logger.error(f"Update {update} caused error {context.error}", exc_info=True)
-        
-        # Don't send error messages for small issues
-        if isinstance(context.error, TelegramError):
-            # These are Telegram API errors, don't show to users
-            return
-        
-        # Only show error message for serious issues
-        if update and update.effective_chat:
-            try:
-                error_msg = (
-                    "❌ An error occurred. Please try again later."
-                )
-                
-                if update.callback_query:
-                    await update.callback_query.message.reply_text(error_msg)
-                elif update.message:
-                    await update.message.reply_text(error_msg)
-            except:
-                pass
-    except Exception as e:
-        logger.error(f"Error in error_handler: {e}")
+    db.reset_daily_counts()
+    logger.info("Daily message counts reset")
 
 def main():
     """Start the bot"""
-    # Create application
+    # Create application with job queue
     application = Application.builder().token(config.Config.TELEGRAM_TOKEN).build()
     
     # Add handlers
@@ -1021,27 +938,35 @@ def main():
         pattern="^(accept|decline)_declaration$"
     ))
     
-    # Error handler
-    application.add_error_handler(error_handler)
-    
     # Job queue for scheduled tasks
     job_queue = application.job_queue
     
-    # Send reminders every day at 10:00 AM
-    job_queue.run_daily(
-        send_reminders,
-        time=config.Config.REMINDER_TIME,
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="send_reminders"
-    )
-    
-    # Reset daily counts at midnight
-    job_queue.run_daily(
-        reset_daily_counts_job,
-        time=time(0, 0),
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="reset_daily_counts"
-    )
+    if job_queue:
+        # Send reminders every day at 10:00 AM
+        job_queue.run_daily(
+            send_reminders,
+            time=config.Config.REMINDER_TIME,
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="send_reminders"
+        )
+        
+        # Check absent users every day at 11:00 PM
+        job_queue.run_daily(
+            check_absent_users,
+            time=time(23, 0),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="check_absent_users"
+        )
+        
+        # Reset daily counts at midnight
+        job_queue.run_daily(
+            reset_daily_counts_job,
+            time=time(0, 0),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="reset_daily_counts"
+        )
+    else:
+        logger.warning("Job queue not available. Scheduled tasks will not run.")
     
     # Start the bot
     print("🤖 Study Bot is starting...")
