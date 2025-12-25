@@ -1,23 +1,14 @@
-from datetime import datetime, date
+from datetime import datetime
 from typing import List, Dict
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import config
 
 class Utils:
     @staticmethod
-    def format_date(d):
-        """Format date for display"""
-        if isinstance(d, date):
-            return d.strftime("%Y-%m-%d")
-        elif isinstance(d, datetime):
-            return d.strftime("%Y-%m-%d")
-        return str(d)
-    
-    @staticmethod
     def format_target_message(target: Dict, user_info: Dict = None) -> str:
         """Format target message for display"""
         emoji = "✅" if target.get("status") == "completed" else "📝"
-        date_str = Utils.format_date(target.get("date", date.today()))
+        date_str = target.get("date", datetime.now().date()).strftime("%Y-%m-%d")
         
         message = f"{emoji} *Target for {date_str}*\n\n"
         message += f"📌 *Target:* {target.get('target', 'No target set')}\n"
@@ -27,7 +18,7 @@ class Utils:
             if isinstance(completed_at, datetime):
                 message += f"✅ *Completed at:* {completed_at.strftime('%H:%M')}\n"
             else:
-                message += f"✅ *Completed at:* {completed_at}\n"
+                message += f"✅ *Completed:* Yes\n"
         else:
             message += "⏳ *Status:* Pending\n"
         
@@ -84,7 +75,7 @@ class Utils:
         message += f"🔥 *Current Streak:* {user_stats.get('current_streak', 0)} days\n"
         message += f"📅 *Active Study Days:* {user_stats.get('active_days', 0)}/30\n"
         
-        # Add motivational message based on stats
+        # Add motivational message
         completion_rate = user_stats.get('completion_rate', 0)
         if completion_rate >= 80:
             message += "\n🌟 *Excellent!* Keep up the great work!"
