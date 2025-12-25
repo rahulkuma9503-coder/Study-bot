@@ -1,7 +1,8 @@
 import os
 import logging
 import asyncio
-from datetime import datetime, date, time, timedelta
+import threading
+from datetime import datetime, time, timedelta
 from typing import Optional, Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
@@ -9,7 +10,6 @@ from telegram.ext import (
     ContextTypes, filters
 )
 from telegram.constants import ParseMode, ChatAction
-
 import config
 from database import MongoDB
 from utils import Utils
@@ -505,7 +505,7 @@ async def addoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌴 *Day Off Added*\n\n"
             f"{user.mention_html()} is taking a day off.\n"
             f"📝 Reason: {reason}\n"
-            f"📅 Date: {date.today().strftime('%Y-%m-%d')}",
+            f"📅 Date: {datetime.now().strftime('%Y-%m-%d')}",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -854,7 +854,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
         
         # Skip if already sent reminder today
         last_reminder = user.get("last_reminder_date")
-        if last_reminder and last_reminder.date() == date.today():
+        if last_reminder and last_reminder.date() == datetime.now().date():
             continue
         
         try:
@@ -999,8 +999,41 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+# Health check server for Render
+def start_health_check_server():
+    """Start a simple HTTP server for health checks"""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import os
+    
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running')
+        
+        def log_message(self, format, *args):
+            # Suppress log messages
+            pass
+    
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    
+    # Run in a separate thread
+    import threading
+    def run_server():
+        logger.info(f"Health check server started on port {port}")
+        server.serve_forever()
+    
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    return server
+
 def main():
     """Start the bot"""
+    # Start health check server for Render
+    start_health_check_server()
+    
     # Create application
     application = Application.builder().token(config.Config.TELEGRAM_TOKEN).build()
     
