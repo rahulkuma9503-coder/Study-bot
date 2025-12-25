@@ -1,4 +1,3 @@
-from typing import Dict
 from datetime import datetime, timedelta, date
 from typing import List, Dict, Optional, Tuple
 from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -55,7 +54,8 @@ class MongoDB:
                 "last_message_date": None,
                 "joined_at": datetime.now(),
                 "consecutive_absence": 0,
-                "warnings": 0
+                "warnings": 0,
+                "last_reminder_date": None
             }
             self.users.insert_one(user_data)
             return True
@@ -108,11 +108,14 @@ class MongoDB:
     
     def extend_user_limit(self, user_id: int, additional_messages: int) -> bool:
         """Extend user's daily message limit"""
-        result = self.users.update_one(
-            {"user_id": user_id},
-            {"$inc": {"daily_limit": additional_messages}}
-        )
-        return result.modified_count > 0
+        try:
+            result = self.users.update_one(
+                {"user_id": user_id},
+                {"$inc": {"daily_limit": additional_messages}}
+            )
+            return result.modified_count > 0
+        except:
+            return False
     
     def set_group_limit(self, group_id: int, limit: int) -> bool:
         """Set default daily limit for group"""
@@ -150,7 +153,8 @@ class MongoDB:
                 "image_id": image_id,
                 "status": "pending",
                 "created_at": datetime.now(),
-                "completed_at": None
+                "completed_at": None,
+                "updated_at": datetime.now()
             }
             self.targets.insert_one(target_data)
             
@@ -179,7 +183,8 @@ class MongoDB:
             {"user_id": user_id, "date": today},
             {"$set": {
                 "status": "completed",
-                "completed_at": datetime.now()
+                "completed_at": datetime.now(),
+                "updated_at": datetime.now()
             }}
         )
         return result.modified_count > 0
@@ -347,7 +352,7 @@ class MongoDB:
                 current_date -= timedelta(days=1)
             else:
                 # Check if day off
-                if self.has_dayoff_today(user_id):
+                if self.dayoffs.find_one({"user_id": user_id, "date": current_date}):
                     streak += 1
                     current_date -= timedelta(days=1)
                 else:
