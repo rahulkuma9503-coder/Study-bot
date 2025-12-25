@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-import threading
+import sys
 from datetime import datetime, time, timedelta
 from typing import Optional, Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
@@ -10,6 +10,8 @@ from telegram.ext import (
     ContextTypes, filters
 )
 from telegram.constants import ParseMode, ChatAction
+from telegram.error import Conflict, RetryAfter, TimedOut
+
 import config
 from database import MongoDB
 from utils import Utils
@@ -316,7 +318,7 @@ async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_
         await send_welcome_and_restrict(update, context, new_member)
 
 async def mytarget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mytarget command - FIXED VERSION"""
+    """Handle /mytarget command"""
     chat = update.effective_chat
     user = update.effective_user
     
@@ -999,86 +1001,194 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+def start_health_check_server():
+    """Start a simple HTTP server for health checks (for Render)"""
+    try:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import threading
+        import os
+        
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Bot is running')
+            
+            def log_message(self, format, *args):
+                # Suppress log messages
+                pass
+        
+        port = int(os.environ.get('PORT', 10000))
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        
+        def run_server():
+            logger.info(f"Health check server started on port {port}")
+            server.serve_forever()
+        
+        thread = threading.Thread(target=run_server, daemon=True)
+        thread.start()
+        return server
+    except Exception as e:
+        logger.error(f"Failed to start health check server: {e}")
+        return None
+
+def run_bot_with_restart():
+    """Run bot with restart logic to handle conflicts"""
+    max_restarts = 5
+    restart_count = 0
+    
+    while restart_count < max_restarts:
+        try:
+            logger.info(f"Starting bot (attempt {restart_count + 1}/{max_restarts})...")
+            
+            # Create application
+            application = Application.builder().token(config.Config.TELEGRAM_TOKEN).build()
+            
+            # Add handlers
+            application.add_handler(CommandHandler("start", start))
+            application.add_handler(CommandHandler("mytarget", mytarget))
+            application.add_handler(CommandHandler("complete", complete))
+            application.add_handler(CommandHandler("addoff", addoff))
+            application.add_handler(CommandHandler("leaderboard", leaderboard))
+            application.add_handler(CommandHandler("progress", progress))
+            application.add_handler(CommandHandler("myday", myday))
+            application.add_handler(CommandHandler("extend", extend))
+            application.add_handler(CommandHandler("setlimit", setlimit))
+            application.add_handler(CommandHandler("help", help_command))
+            
+            # Message handlers
+            application.add_handler(MessageHandler(
+                filters.StatusUpdate.NEW_CHAT_MEMBERS,
+                handle_new_chat_members
+            ))
+            
+            # All other messages
+            application.add_handler(MessageHandler(
+                filters.ALL & filters.ChatType.GROUPS,
+                handle_all_messages
+            ))
+            
+            # Callback query handler
+            application.add_handler(CallbackQueryHandler(
+                handle_declaration_callback,
+                pattern="^(accept|decline)_declaration$"
+            ))
+            
+            # Error handler
+            application.add_error_handler(error_handler)
+            
+            # Job queue for scheduled tasks
+            job_queue = application.job_queue
+            
+            # Send reminders every day at 10:00 AM
+            job_queue.run_daily(
+                send_reminders,
+                time=config.Config.REMINDER_TIME,
+                days=(0, 1, 2, 3, 4, 5, 6),
+                name="send_reminders"
+            )
+            
+            # Check absent users every day at 11:00 PM
+            job_queue.run_daily(
+                check_absent_users,
+                time=time(23, 0),
+                days=(0, 1, 2, 3, 4, 5, 6),
+                name="check_absent_users"
+            )
+            
+            # Reset daily counts at midnight
+            job_queue.run_daily(
+                reset_daily_counts_job,
+                time=time(0, 0),
+                days=(0, 1, 2, 3, 4, 5, 6),
+                name="reset_daily_counts"
+            )
+            
+            # Check unregistered users every 6 hours
+            job_queue.run_repeating(
+                check_unregistered_users,
+                interval=21600,  # 6 hours in seconds
+                first=10,
+                name="check_unregistered_users"
+            )
+            
+            # Start health check server for Render
+            start_health_check_server()
+            
+            # Start the bot
+            print("🤖 Study Bot is starting...")
+            print(f"📊 Group ID: {config.Config.ALLOWED_GROUP_ID}")
+            print(f"👑 Admin ID: {config.Config.ADMIN_USER_ID}")
+            print(f"🔗 Group Link: {config.Config.GROUP_LINK}")
+            
+            # Run with specific parameters to avoid conflicts
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                poll_interval=1.0,
+                timeout=30,
+                drop_pending_updates=True,
+                close_loop=False
+            )
+            
+        except Conflict as e:
+            restart_count += 1
+            logger.error(f"Conflict detected: {e}")
+            logger.info(f"Restarting bot in 10 seconds... (Attempt {restart_count}/{max_restarts})")
+            time.sleep(10)
+            
+        except RetryAfter as e:
+            logger.warning(f"Rate limited. Waiting {e.retry_after} seconds...")
+            time.sleep(e.retry_after)
+            restart_count += 1
+            
+        except TimedOut as e:
+            logger.warning(f"Timeout error: {e}. Restarting...")
+            restart_count += 1
+            time.sleep(10)
+            
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            restart_count += 1
+            logger.info(f"Restarting bot in 10 seconds... (Attempt {restart_count}/{max_restarts})")
+            time.sleep(10)
+    
+    logger.error(f"Max restart attempts ({max_restarts}) reached. Exiting.")
+
 def main():
-    """Start the bot"""
-    # Create application
-    application = Application.builder().token(config.Config.TELEGRAM_TOKEN).build()
+    """Main function to run the bot"""
+    # Check if bot token is set
+    if not config.Config.TELEGRAM_TOKEN or config.Config.TELEGRAM_TOKEN == "your_bot_token_here":
+        logger.error("Bot token not set! Please set TELEGRAM_TOKEN in environment variables.")
+        return
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("mytarget", mytarget))
-    application.add_handler(CommandHandler("complete", complete))
-    application.add_handler(CommandHandler("addoff", addoff))
-    application.add_handler(CommandHandler("leaderboard", leaderboard))
-    application.add_handler(CommandHandler("progress", progress))
-    application.add_handler(CommandHandler("myday", myday))
-    application.add_handler(CommandHandler("extend", extend))
-    application.add_handler(CommandHandler("setlimit", setlimit))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # Message handlers
-    application.add_handler(MessageHandler(
-        filters.StatusUpdate.NEW_CHAT_MEMBERS,
-        handle_new_chat_members
-    ))
-    
-    # All other messages
-    application.add_handler(MessageHandler(
-        filters.ALL & filters.ChatType.GROUPS,
-        handle_all_messages
-    ))
-    
-    # Callback query handler
-    application.add_handler(CallbackQueryHandler(
-        handle_declaration_callback,
-        pattern="^(accept|decline)_declaration$"
-    ))
-    
-    # Error handler
-    application.add_error_handler(error_handler)
-    
-    # Job queue for scheduled tasks
-    job_queue = application.job_queue
-    
-    # Send reminders every day at 10:00 AM
-    job_queue.run_daily(
-        send_reminders,
-        time=config.Config.REMINDER_TIME,
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="send_reminders"
-    )
-    
-    # Check absent users every day at 11:00 PM
-    job_queue.run_daily(
-        check_absent_users,
-        time=time(23, 0),
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="check_absent_users"
-    )
-    
-    # Reset daily counts at midnight
-    job_queue.run_daily(
-        reset_daily_counts_job,
-        time=time(0, 0),
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="reset_daily_counts"
-    )
-    
-    # Check unregistered users every 6 hours
-    job_queue.run_repeating(
-        check_unregistered_users,
-        interval=21600,  # 6 hours in seconds
-        first=10,
-        name="check_unregistered_users"
-    )
-    
-    # Start the bot
-    print("🤖 Study Bot is starting...")
-    print(f"📊 Group ID: {config.Config.ALLOWED_GROUP_ID}")
-    print(f"👑 Admin ID: {config.Config.ADMIN_USER_ID}")
-    print(f"🔗 Group Link: {config.Config.GROUP_LINK}")
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run bot with restart logic
+    run_bot_with_restart()
 
 if __name__ == '__main__':
+    # Add simple health check for Render
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthCheck(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running')
+        
+        def log_message(self, format, *args):
+            pass
+    
+    def run_health_check():
+        port = int(os.getenv('PORT', 8080))
+        server = HTTPServer(('0.0.0.0', port), HealthCheck)
+        logger.info(f"Health check server started on port {port}")
+        server.serve_forever()
+    
+    # Start health check in background thread
+    health_thread = threading.Thread(target=run_health_check, daemon=True)
+    health_thread.start()
+    
+    # Run main bot
     main()
