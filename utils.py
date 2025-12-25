@@ -5,17 +5,29 @@ import config
 
 class Utils:
     @staticmethod
+    def format_date(d):
+        """Format date for display"""
+        if isinstance(d, date):
+            return d.strftime("%Y-%m-%d")
+        elif isinstance(d, datetime):
+            return d.strftime("%Y-%m-%d")
+        return str(d)
+    
+    @staticmethod
     def format_target_message(target: Dict, user_info: Dict = None) -> str:
         """Format target message for display"""
         emoji = "✅" if target.get("status") == "completed" else "📝"
-        date_str = target.get("date", date.today()).strftime("%Y-%m-%d")
+        date_str = Utils.format_date(target.get("date", date.today()))
         
         message = f"{emoji} *Target for {date_str}*\n\n"
         message += f"📌 *Target:* {target.get('target', 'No target set')}\n"
         
         if target.get("status") == "completed":
             completed_at = target.get("completed_at", datetime.now())
-            message += f"✅ *Completed at:* {completed_at.strftime('%H:%M')}\n"
+            if isinstance(completed_at, datetime):
+                message += f"✅ *Completed at:* {completed_at.strftime('%H:%M')}\n"
+            else:
+                message += f"✅ *Completed at:* {completed_at}\n"
         else:
             message += "⏳ *Status:* Pending\n"
         
