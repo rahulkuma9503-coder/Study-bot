@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta, date
+
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
@@ -38,6 +39,10 @@ class MongoDB:
         
         # Settings collection
         self.settings.create_index([("group_id", ASCENDING)], unique=True)
+    
+    def get_today_date(self):
+        """Get today's date as string for MongoDB storage"""
+        return datetime.now().date()
     
     # User Management
     def add_user(self, user_id: int, username: str, first_name: str, group_id: int) -> bool:
@@ -83,7 +88,7 @@ class MongoDB:
     
     def update_daily_message_count(self, user_id: int) -> Tuple[int, int]:
         """Update message count for today, returns (current_count, limit)"""
-        today = date.today()
+        today = self.get_today_date()
         user = self.get_user(user_id)
         
         if not user:
@@ -143,7 +148,7 @@ class MongoDB:
     # Target Management
     def add_target(self, user_id: int, target_text: str, image_id: str = None) -> bool:
         """Add target for today"""
-        today = date.today()
+        today = self.get_today_date()
         
         try:
             target_data = {
@@ -178,7 +183,7 @@ class MongoDB:
     
     def complete_target(self, user_id: int) -> bool:
         """Mark today's target as completed"""
-        today = date.today()
+        today = self.get_today_date()
         result = self.targets.update_one(
             {"user_id": user_id, "date": today},
             {"$set": {
@@ -190,12 +195,12 @@ class MongoDB:
         return result.modified_count > 0
     
     def get_today_target(self, user_id: int) -> Optional[Dict]:
-        today = date.today()
+        today = self.get_today_date()
         return self.targets.find_one({"user_id": user_id, "date": today})
     
     def get_user_targets(self, user_id: int, days: int = 7) -> List[Dict]:
         """Get user's targets for last N days"""
-        start_date = date.today() - timedelta(days=days)
+        start_date = datetime.now().date() - timedelta(days=days)
         return list(self.targets.find({
             "user_id": user_id,
             "date": {"$gte": start_date}
@@ -204,7 +209,7 @@ class MongoDB:
     # Day Off Management
     def add_dayoff(self, user_id: int, reason: str) -> bool:
         """Mark today as day off"""
-        today = date.today()
+        today = self.get_today_date()
         
         try:
             dayoff_data = {
@@ -225,13 +230,13 @@ class MongoDB:
             return False
     
     def has_dayoff_today(self, user_id: int) -> bool:
-        today = date.today()
+        today = self.get_today_date()
         return self.dayoffs.find_one({"user_id": user_id, "date": today}) is not None
     
     # Statistics and Reminders
     def get_users_without_target_today(self, group_id: int) -> List[Dict]:
         """Get registered users who haven't set target or taken day off today"""
-        today = date.today()
+        today = self.get_today_date()
         
         # Get all registered users in group
         all_users = list(self.users.find({
@@ -280,7 +285,7 @@ class MongoDB:
     # Leaderboard
     def get_leaderboard(self, group_id: int, days: int = 30) -> List[Dict]:
         """Get leaderboard based on completed targets"""
-        start_date = date.today() - timedelta(days=days)
+        start_date = datetime.now().date() - timedelta(days=days)
         
         pipeline = [
             {
@@ -320,7 +325,7 @@ class MongoDB:
     
     def get_user_stats(self, user_id: int, days: int = 30) -> Dict:
         """Get user statistics"""
-        start_date = date.today() - timedelta(days=days)
+        start_date = datetime.now().date() - timedelta(days=days)
         
         # Get targets in date range
         targets = list(self.targets.find({
@@ -331,16 +336,19 @@ class MongoDB:
         total_days = days
         completed = len([t for t in targets if t.get("status") == "completed"])
         pending = len([t for t in targets if t.get("status") == "pending"])
-        dayoffs = len(list(self.dayoffs.find({
+        
+        # Get dayoffs in date range
+        dayoffs = list(self.dayoffs.find({
             "user_id": user_id,
             "date": {"$gte": start_date}
-        })))
+        }))
+        dayoff_count = len(dayoffs)
         
-        active_days = total_days - dayoffs
+        active_days = total_days - dayoff_count
         completion_rate = (completed / active_days * 100) if active_days > 0 else 0
         
         # Current streak
-        today = date.today()
+        today = datetime.now().date()
         streak = 0
         current_date = today
         
@@ -349,19 +357,19 @@ class MongoDB:
             target = self.targets.find_one({"user_id": user_id, "date": current_date})
             if target and target.get("status") == "completed":
                 streak += 1
-                current_date -= timedelta(days=1)
+                current_date = current_date - timedelta(days=1)
             else:
                 # Check if day off
                 if self.dayoffs.find_one({"user_id": user_id, "date": current_date}):
                     streak += 1
-                    current_date -= timedelta(days=1)
+                    current_date = current_date - timedelta(days=1)
                 else:
                     break
         
         return {
             "completed_targets": completed,
             "pending_targets": pending,
-            "dayoffs": dayoffs,
+            "dayoffs": dayoff_count,
             "completion_rate": round(completion_rate, 1),
             "current_streak": streak,
             "active_days": active_days
