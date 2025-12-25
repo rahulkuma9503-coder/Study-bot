@@ -999,41 +999,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-# Health check server for Render
-def start_health_check_server():
-    """Start a simple HTTP server for health checks"""
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    import os
-    
-    class HealthCheckHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'Bot is running')
-        
-        def log_message(self, format, *args):
-            # Suppress log messages
-            pass
-    
-    port = int(os.environ.get('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    
-    # Run in a separate thread
-    import threading
-    def run_server():
-        logger.info(f"Health check server started on port {port}")
-        server.serve_forever()
-    
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
-    return server
-
 def main():
     """Start the bot"""
-    # Start health check server for Render
-    start_health_check_server()
-    
     # Create application
     application = Application.builder().token(config.Config.TELEGRAM_TOKEN).build()
     
