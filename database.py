@@ -7,7 +7,7 @@ import config
 
 class MongoDB:
     def __init__(self):
-        self.client = MongoClient(config.Config.MONGODB_URI, serverSelectionTimeoutMS=5000)
+        self.client = MongoClient(config.Config.MONGODB_URI)
         self.db = self.client.study_bot
         
         # Collections
@@ -82,7 +82,11 @@ class MongoDB:
             return (0, config.Config.DEFAULT_DAILY_MESSAGE_LIMIT)
         
         # Reset counter if it's a new day
-        if user.get("last_message_date") != today:
+        last_date = user.get("last_message_date")
+        if last_date and isinstance(last_date, datetime):
+            last_date = last_date.date()
+        
+        if last_date != today:
             self.users.update_one(
                 {"user_id": user_id},
                 {"$set": {"messages_today": 1, "last_message_date": today}}
@@ -141,6 +145,12 @@ class MongoDB:
                 "completed_at": None
             }
             self.targets.insert_one(target_data)
+            
+            # Reset consecutive absence on target submission
+            self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"consecutive_absence": 0}}
+            )
             return True
         except DuplicateKeyError:
             # Update existing target
@@ -183,6 +193,12 @@ class MongoDB:
                 "created_at": datetime.now()
             }
             self.dayoffs.insert_one(dayoff_data)
+            
+            # Reset consecutive absence on day off
+            self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"consecutive_absence": 0}}
+            )
             return True
         except DuplicateKeyError:
             return False
@@ -238,30 +254,30 @@ class MongoDB:
         """Get leaderboard based on completed targets"""
         start_date = datetime.now().date() - timedelta(days=days)
         
-        # Get all completed targets in date range
+        # Simple approach - get all completed targets and count
         completed_targets = list(self.targets.find({
             "date": {"$gte": start_date},
             "status": "completed"
         }))
         
-        # Group by user
-        user_stats = {}
+        # Count by user
+        user_counts = {}
         for target in completed_targets:
             user_id = target["user_id"]
-            if user_id not in user_stats:
-                user_stats[user_id] = 0
-            user_stats[user_id] += 1
+            if user_id not in user_counts:
+                user_counts[user_id] = 0
+            user_counts[user_id] += 1
         
-        # Get user info and filter by group
+        # Get user info and sort
         leaderboard = []
-        for user_id, completed_count in sorted(user_stats.items(), key=lambda x: x[1], reverse=True)[:20]:
+        for user_id, count in sorted(user_counts.items(), key=lambda x: x[1], reverse=True)[:20]:
             user = self.get_user(user_id)
-            if user and user.get("group_id") == group_id and user.get("registered"):
+            if user and user.get("group_id") == group_id and user.get("registered", False):
                 leaderboard.append({
                     "user_id": user_id,
-                    "completed_targets": completed_count,
+                    "completed_targets": count,
                     "username": user.get("username"),
-                    "first_name": user.get("first_name")
+                    "first_name": user.get("first_name", "Unknown")
                 })
         
         return leaderboard
@@ -290,10 +306,11 @@ class MongoDB:
         active_days = total_days - dayoff_count
         completion_rate = (completed / active_days * 100) if active_days > 0 else 0
         
-        # Current streak (simplified)
+        # Simple streak calculation
         streak = 0
+        today = datetime.now().date()
         for i in range(days):
-            check_date = datetime.now().date() - timedelta(days=i)
+            check_date = today - timedelta(days=i)
             target = self.targets.find_one({"user_id": user_id, "date": check_date, "status": "completed"})
             if target:
                 streak += 1
