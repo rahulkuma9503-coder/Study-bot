@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+import time
 from typing import Dict, List
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -10,18 +12,28 @@ from telegram.ext import (
     ConversationHandler
 )
 from database import MongoDB
+from flask import Flask, jsonify
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-ALLOWED_GROUP_ID = os.getenv('ALLOWED_GROUP_ID')  # Your group ID
-ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')  # Your user ID
+ALLOWED_GROUP_ID = os.getenv('ALLOWED_GROUP_ID')
+ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
 MONGODB_URI = os.getenv('MONGODB_URI')
+PORT = int(os.getenv('PORT', 10000))
 
-# Conversation states
-RULES, ACCEPT = range(2)
+# Create Flask app for health checks
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok"})
 
 # Initialize MongoDB
 db = MongoDB(MONGODB_URI)
@@ -33,6 +45,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Bot status tracking
+bot_status = {
+    "is_running": False,
+    "last_heartbeat": None,
+    "start_time": None,
+    "processed_messages": 0
+}
+
 # Check if user is in allowed group
 def is_allowed_group(chat_id: str) -> bool:
     return str(chat_id) == ALLOWED_GROUP_ID
@@ -42,7 +62,7 @@ def is_admin(user_id: str) -> bool:
     return str(user_id) == ADMIN_USER_ID
 
 # Mute user in group
-async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, reason: str = "Not registered"):
     """Mute a user in the group"""
     try:
         permissions = ChatPermissions(
@@ -60,8 +80,9 @@ async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TY
             chat_id=chat_id,
             user_id=user_id,
             permissions=permissions,
-            until_date=datetime.now() + timedelta(days=365)  # Mute for 1 year or until registered
+            until_date=datetime.now() + timedelta(days=365)
         )
+        logger.info(f"Muted user {user_id} in group {chat_id}: {reason}")
         return True
     except Exception as e:
         logger.error(f"Failed to mute user {user_id}: {e}")
@@ -78,7 +99,7 @@ async def unmute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_
             can_send_other_messages=True,
             can_add_web_page_previews=True,
             can_change_info=False,
-            can_invite_users=False,
+            can_invite_users=True,
             can_pin_messages=False
         )
         
@@ -87,9 +108,49 @@ async def unmute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_
             user_id=user_id,
             permissions=permissions
         )
+        logger.info(f"Unmuted user {user_id} in group {chat_id}")
         return True
     except Exception as e:
         logger.error(f"Failed to unmute user {user_id}: {e}")
+        return False
+
+# Send registration prompt
+async def send_registration_prompt(chat_id: int, user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE, registration_id: str = None):
+    """Send registration prompt to user"""
+    try:
+        if not registration_id:
+            # Create new registration
+            registration_id = db.add_registration(user_id, chat_id, username)
+        
+        keyboard = [[
+            InlineKeyboardButton(
+                "📝 Register Now", 
+                url=f"https://t.me/{context.bot.username}?start=register_{registration_id}"
+            )
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        welcome_message = (
+            f"👋 @{username}, welcome to our study group!\n\n"
+            "📋 **Group Rules:**\n"
+            "1. Be respectful to all members\n"
+            "2. No spam or self-promotion\n"
+            "3. Stay on topic - this is a study group\n"
+            "4. Use appropriate language\n"
+            "5. Follow Telegram's Terms of Service\n\n"
+            "⚠️ **You need to complete registration to participate**\n"
+            "Click the button below to start registration."
+        )
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=welcome_message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send registration prompt to {user_id}: {e}")
         return False
 
 # Handler for new members joining the group
@@ -111,49 +172,91 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if member.id == context.bot.id:
             continue
         
+        # Track member in database
+        db.add_group_member(user_id, update.effective_chat.id, username)
+        
         # Check if user is already registered
         if db.is_user_registered(user_id, update.effective_chat.id):
             await update.message.reply_text(
-                f"Welcome back, {username}! You're already registered."
+                f"Welcome back, @{username}! You're already registered."
             )
             continue
         
         # Mute the new member
-        await mute_user(update.effective_chat.id, user_id, context)
+        await mute_user(update.effective_chat.id, user_id, context, "New member registration required")
         
-        # Add to registration database
-        registration_id = db.add_registration(user_id, update.effective_chat.id, username)
-        
-        # Create registration button
-        keyboard = [[
-            InlineKeyboardButton(
-                "📝 Register Now", 
-                url=f"https://t.me/{context.bot.username}?start=register_{registration_id}"
-            )
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Send welcome message with registration button
-        welcome_message = (
-            f"👋 Welcome {username} to our study group!\n\n"
-            "📋 **Group Rules:**\n"
-            "1. Be respectful to all members\n"
-            "2. No spam or self-promotion\n"
-            "3. Stay on topic - this is a study group\n"
-            "4. Use appropriate language\n"
-            "5. Follow Telegram's Terms of Service\n\n"
-            "⚠️ **You are currently muted**\n"
-            "To participate in the group, you must complete registration.\n"
-            "Click the button below to start registration."
-        )
-        
-        await update.message.reply_text(
-            welcome_message,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
+        # Send registration prompt
+        await send_registration_prompt(
+            update.effective_chat.id, 
+            user_id, 
+            username, 
+            context
         )
 
-# Start command - modified to handle registration
+# Command to check and register existing members
+async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check existing members and register those who aren't"""
+    if not is_allowed_group(update.effective_chat.id):
+        return
+    
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("This command is for admins only.")
+        return
+    
+    await update.message.reply_text("🔍 Checking existing members...")
+    
+    # Get unregistered members
+    unregistered_members = db.check_and_register_existing_members(
+        update.effective_chat.id, 
+        context
+    )
+    
+    if not unregistered_members:
+        await update.message.reply_text("✅ All members are already registered!")
+        return
+    
+    # Process each unregistered member
+    processed = 0
+    for member in unregistered_members:
+        try:
+            # Try to get member info
+            chat_member = await context.bot.get_chat_member(
+                update.effective_chat.id,
+                member["user_id"]
+            )
+            
+            username = chat_member.user.username or chat_member.user.first_name
+            
+            # Mute the member
+            await mute_user(
+                update.effective_chat.id, 
+                member["user_id"], 
+                context, 
+                "Existing member registration required"
+            )
+            
+            # Send registration prompt
+            await send_registration_prompt(
+                update.effective_chat.id,
+                member["user_id"],
+                username,
+                context,
+                member["registration_id"]
+            )
+            
+            processed += 1
+            time.sleep(0.5)  # Avoid rate limiting
+            
+        except Exception as e:
+            logger.error(f"Error processing member {member['user_id']}: {e}")
+            continue
+    
+    await update.message.reply_text(
+        f"✅ Processed {processed} unregistered members.\n"
+        f"They have been muted and sent registration prompts."
+    )
+
+# Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
@@ -231,9 +334,6 @@ async def accept_rules_callback(update: Update, context: ContextTypes.DEFAULT_TY
     registration_id = data[2]
     user_id = query.from_user.id
     
-    # In a real implementation, you would verify the registration_id
-    # For now, we'll accept it
-    
     # Mark rules as accepted in database
     success = db.accept_rules(user_id, int(ALLOWED_GROUP_ID))
     
@@ -264,7 +364,7 @@ async def accept_rules_callback(update: Update, context: ContextTypes.DEFAULT_TY
             "❌ Registration failed. Please contact an admin for assistance."
         )
 
-# Modified command handlers to check registration status
+# Modified wrapper to check registration for commands
 async def check_registration_and_execute(update: Update, context: ContextTypes.DEFAULT_TYPE, command_func):
     """Check if user is registered before executing command"""
     if not is_allowed_group(update.effective_chat.id):
@@ -275,9 +375,33 @@ async def check_registration_and_execute(update: Update, context: ContextTypes.D
     
     # Check if user is registered
     if not db.is_user_registered(user_id, chat_id):
+        # Get registration status
+        registration = db.get_registration_status(user_id, chat_id)
+        
+        # If not in registration database, add them
+        if not registration:
+            username = update.effective_user.username or update.effective_user.first_name
+            registration_id = db.add_registration(user_id, chat_id, username)
+        else:
+            registration_id = str(registration.get('_id', ''))
+        
+        # Mute the user if they try to use commands
+        await mute_user(chat_id, user_id, context, "Tried to use commands without registration")
+        
+        # Send registration prompt
+        keyboard = [[
+            InlineKeyboardButton(
+                "📝 Register Now", 
+                url=f"https://t.me/{context.bot.username}?start=register_{registration_id}"
+            )
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await update.message.reply_text(
-            "⚠️ You need to complete registration to use this command.\n"
-            "Please wait for the registration prompt or contact an admin."
+            f"⚠️ @{update.effective_user.username or update.effective_user.first_name}, "
+            "you need to register before using bot commands.\n\n"
+            "Click the button below to register:",
+            reply_markup=reply_markup
         )
         return
     
@@ -306,7 +430,7 @@ async def export_data_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def help_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await check_registration_and_execute(update, context, help_command)
 
-# Original command functions (unchanged from your code)
+# Original command functions (keep from your code)
 async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
@@ -482,6 +606,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/completed <id> - Mark target as completed\n"
         "/stats - View your study statistics\n"
         "/export - Admin: Export all data (admin only)\n"
+        "/checkmembers - Admin: Check and register existing members\n"
+        "/registeruser - Admin: Manually register a user\n"
         "/help - Show this help message\n\n"
         "Tips:\n"
         "• Set realistic targets\n"
@@ -491,14 +617,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     await update.message.reply_text(help_text)
-
-# Error handler
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
-    if update and update.effective_chat:
-        await update.effective_chat.send_message(
-            "An error occurred. Please try again later."
-        )
 
 # Admin command to manually register users
 async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -510,38 +628,80 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This command is for admins only.")
         return
     
-    if not context.args:
+    if not context.args and not update.message.reply_to_message:
         await update.message.reply_text(
             "Usage: /registeruser <user_id> or reply to user's message with /registeruser"
         )
         return
     
-    # Check if replying to a message
-    if update.message.reply_to_message:
-        user_id = update.message.reply_to_message.from_user.id
-        username = update.message.reply_to_message.from_user.username
-    else:
-        try:
+    try:
+        if update.message.reply_to_message:
+            user_id = update.message.reply_to_message.from_user.id
+            username = update.message.reply_to_message.from_user.username or update.message.reply_to_message.from_user.first_name
+        else:
             user_id = int(context.args[0])
             username = context.args[1] if len(context.args) > 1 else "Unknown"
-        except ValueError:
-            await update.message.reply_text("Invalid user ID.")
+        
+        # Check if already registered
+        if db.is_user_registered(user_id, update.effective_chat.id):
+            await update.message.reply_text(
+                f"✅ User @{username} (ID: {user_id}) is already registered."
+            )
             return
-    
-    # Register user
-    success = db.accept_rules(user_id, update.effective_chat.id)
-    
-    if success:
-        # Unmute user
-        await unmute_user(update.effective_chat.id, user_id, context)
-        await update.message.reply_text(
-            f"✅ User {username} (ID: {user_id}) has been registered and unmuted."
-        )
-    else:
-        await update.message.reply_text("Failed to register user.")
+        
+        # Register user
+        success = db.accept_rules(user_id, update.effective_chat.id)
+        
+        if success:
+            # Unmute user
+            await unmute_user(update.effective_chat.id, user_id, context)
+            await update.message.reply_text(
+                f"✅ User @{username} (ID: {user_id}) has been registered and unmuted."
+            )
+        else:
+            await update.message.reply_text("Failed to register user.")
+            
+    except Exception as e:
+        await update.message.reply_text(f"Error: {str(e)}")
+
+# Error handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.effective_chat:
+        try:
+            await update.effective_chat.send_message(
+                "An error occurred. Please try again later."
+            )
+        except:
+            pass
+
+# Heartbeat function
+def send_heartbeat():
+    """Send periodic heartbeat to keep the bot alive"""
+    while True:
+        bot_status["last_heartbeat"] = datetime.now()
+        time.sleep(300)  # Every 5 minutes
+
+# Start Flask server in a separate thread
+def start_flask():
+    """Start Flask server for health checks"""
+    app.run(host='0.0.0.0', port=PORT)
 
 # Main function
 def main():
+    # Update bot status
+    bot_status["is_running"] = True
+    bot_status["start_time"] = datetime.now()
+    bot_status["last_heartbeat"] = datetime.now()
+    
+    # Start heartbeat thread
+    heartbeat_thread = threading.Thread(target=send_heartbeat, daemon=True)
+    heartbeat_thread.start()
+    
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+    
     # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
@@ -551,6 +711,7 @@ def main():
         filters.StatusUpdate.NEW_CHAT_MEMBERS, 
         new_member_handler
     ))
+    application.add_handler(CommandHandler("checkmembers", check_existing_members))
     application.add_handler(CommandHandler("settarget", set_target_wrapper))
     application.add_handler(CommandHandler("mytargets", my_targets_wrapper))
     application.add_handler(CommandHandler("progress", update_progress_wrapper))
@@ -567,7 +728,22 @@ def main():
     
     # Start the bot
     print("Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print(f"Bot status: {bot_status}")
+    print(f"Flask server running on port {PORT}")
+    
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False
+        )
+    except KeyboardInterrupt:
+        print("\nBot stopped by user")
+    except Exception as e:
+        print(f"Bot stopped with error: {e}")
+    finally:
+        bot_status["is_running"] = False
+        db.close()
 
 if __name__ == '__main__':
     main()
