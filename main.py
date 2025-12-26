@@ -65,24 +65,41 @@ def is_allowed_group(chat_id: str) -> bool:
 def is_admin(user_id: str) -> bool:
     return str(user_id) == ADMIN_USER_ID
 
-# SIMPLIFIED MUTE FUNCTION - FIXED
+# COMPATIBLE MUTE FUNCTION - Works with older python-telegram-bot versions
 async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, reason: str = "Not registered") -> bool:
-    """Mute a user in the group - SIMPLIFIED VERSION"""
+    """Mute a user in the group - COMPATIBLE VERSION"""
     try:
         # Log the attempt
         logger.info(f"Attempting to mute user {user_id} in chat {chat_id} for: {reason}")
         
-        # Create restrictive permissions
-        permissions = ChatPermissions(
-            can_send_messages=False,
-            can_send_media_messages=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False
-        )
+        # Try different permission formats for compatibility
+        try:
+            # Try new version format (python-telegram-bot >= 13.0)
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False
+            )
+        except TypeError as e:
+            if "can_send_media_messages" in str(e):
+                # Fallback to older version format
+                logger.info("Using older ChatPermissions format (no can_send_media_messages)")
+                permissions = ChatPermissions(
+                    can_send_messages=False,
+                    can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                    can_change_info=False,
+                    can_invite_users=False,
+                    can_pin_messages=False
+                )
+            else:
+                raise e
         
         # Try to restrict the user
         await context.bot.restrict_chat_member(
@@ -107,21 +124,38 @@ async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TY
         
         return False
 
-# SIMPLIFIED UNMUTE FUNCTION - FIXED
+# COMPATIBLE UNMUTE FUNCTION
 async def unmute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Unmute a user in the group - SIMPLIFIED VERSION"""
+    """Unmute a user in the group - COMPATIBLE VERSION"""
     try:
-        # Create normal permissions
-        permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=True,
-            can_pin_messages=False
-        )
+        # Try different permission formats for compatibility
+        try:
+            # Try new version format
+            permissions = ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_change_info=False,
+                can_invite_users=True,
+                can_pin_messages=False
+            )
+        except TypeError as e:
+            if "can_send_media_messages" in str(e):
+                # Fallback to older version format
+                logger.info("Using older ChatPermissions format for unmute")
+                permissions = ChatPermissions(
+                    can_send_messages=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                    can_change_info=False,
+                    can_invite_users=True,
+                    can_pin_messages=False
+                )
+            else:
+                raise e
         
         # Restore permissions
         await context.bot.restrict_chat_member(
@@ -149,15 +183,18 @@ async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         logger.error(f"Error checking bot admin status: {e}")
         return False
 
-# FIXED: Send registration prompt
+# Send registration prompt
 async def send_registration_prompt(chat_id: int, user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE, registration_id: str = None) -> bool:
-    """Send registration prompt to user - FIXED VERSION"""
+    """Send registration prompt to user"""
     try:
         logger.info(f"Sending registration prompt to user {user_id} ({username})")
         
         # If no registration_id provided, create one
         if not registration_id:
             registration_id = db.add_registration(user_id, chat_id, username)
+            if not registration_id:
+                logger.error(f"Failed to create registration for user {user_id}")
+                return False
             logger.info(f"Created new registration with ID: {registration_id}")
         
         # Create the registration button
@@ -191,39 +228,32 @@ async def send_registration_prompt(chat_id: int, user_id: int, username: str, co
                 parse_mode='Markdown'
             )
             logger.info(f"✅ Registration prompt sent to group for user {user_id}")
+            return True
+        except Exception as group_error:
+            logger.error(f"Failed to send registration prompt in group: {group_error}")
             
-            # Also try to send a DM
+            # Try to send as a reply instead
             try:
-                dm_message = (
-                    f"👋 Hello {username}!\n\n"
-                    "You've been added to our study group. "
-                    "To participate, you need to complete registration.\n\n"
-                    "Click the button below to register:"
-                )
-                
+                # Try to get the last message in chat to reply to
                 await context.bot.send_message(
-                    chat_id=user_id,
-                    text=dm_message,
+                    chat_id=chat_id,
+                    text=f"@{username}, please complete registration to participate!\n\nClick the button below:",
                     reply_markup=reply_markup,
                     parse_mode='Markdown'
                 )
-                logger.info(f"✅ Registration prompt sent via DM to user {user_id}")
-            except Exception as dm_error:
-                logger.warning(f"Could not send DM to user {user_id}: {dm_error}")
+                logger.info(f"✅ Registration prompt sent as reply for user {user_id}")
+                return True
+            except Exception as reply_error:
+                logger.error(f"Failed to send reply registration prompt: {reply_error}")
+                return False
                 
-        except Exception as group_error:
-            logger.error(f"Failed to send registration prompt in group: {group_error}")
-            return False
-            
-        return True
-        
     except Exception as e:
         logger.error(f"Failed to send registration prompt to {user_id}: {e}")
         return False
 
-# FIXED: Handler for new members joining the group
+# Handler for new members joining the group
 async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new members joining the group - FIXED VERSION"""
+    """Handle new members joining the group"""
     try:
         if not is_allowed_group(update.effective_chat.id):
             return
@@ -281,22 +311,26 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     
             else:
                 logger.error(f"❌ Failed to mute new member {username}")
-                await update.message.reply_text(
-                    f"⚠️ Failed to mute @{username}. Bot may need admin permissions."
+                # Still try to send registration prompt even if mute failed
+                await send_registration_prompt(
+                    update.effective_chat.id, 
+                    user_id, 
+                    username, 
+                    context
                 )
                 
     except Exception as e:
         logger.error(f"Error in new_member_handler: {e}")
 
-# FIXED: Handler for ALL messages - CHECK AND MUTE UNREGISTERED USERS
+# Handler for ALL messages - CHECK AND MUTE UNREGISTERED USERS
 async def check_and_mute_unregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check all messages and mute unregistered users - FIXED VERSION"""
+    """Check all messages and mute unregistered users"""
     try:
         # Skip if no message
         if not update.message or not update.message.text:
             return
         
-        # Skip if it's a command
+        # Skip if it's a command (start with '/')
         if update.message.text.startswith('/'):
             return
         
@@ -328,6 +362,9 @@ async def check_and_mute_unregistered(update: Update, context: ContextTypes.DEFA
             # Try to mute the user
             mute_success = await mute_user(chat_id, user_id, context, "Unregistered user sent message")
             
+            if mute_success:
+                logger.info(f"✅ Muted unregistered user {username}")
+            
             # Get or create registration
             registration = db.get_registration_status(user_id, chat_id)
             if not registration:
@@ -337,7 +374,7 @@ async def check_and_mute_unregistered(update: Update, context: ContextTypes.DEFA
                 registration_id = str(registration.get('_id', ''))
                 logger.info(f"Found existing registration for user {username}")
             
-            # Always send registration prompt (even if mute failed)
+            # Send registration prompt
             await send_registration_prompt(
                 chat_id,
                 user_id,
