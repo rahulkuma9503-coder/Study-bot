@@ -2,8 +2,10 @@ import os
 import logging
 import threading
 import time
+import asyncio
+import schedule
 from typing import Dict, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
@@ -12,7 +14,7 @@ from telegram.ext import (
 )
 from database import MongoDB
 from flask import Flask, jsonify
-import uuid  # Add this import
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -23,6 +25,9 @@ ALLOWED_GROUP_ID = os.getenv('ALLOWED_GROUP_ID')
 ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
 MONGODB_URI = os.getenv('MONGODB_URI')
 PORT = int(os.getenv('PORT', 10000))
+
+# Notification times (24-hour format)
+NOTIFICATION_TIMES = [9, 12, 15, 17]  # 9 AM, 12 PM, 3 PM, 5 PM
 
 # Create Flask app for health checks
 app = Flask(__name__)
@@ -256,6 +261,340 @@ async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_T
         f"They have been muted and sent registration prompts."
     )
 
+# Send daily reminder notifications
+async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Send daily reminders to users who haven't uploaded targets"""
+    try:
+        today = date.today()
+        current_hour = datetime.now().hour
+        
+        # Determine notification type based on hour
+        notification_types = {
+            9: "first",
+            12: "second", 
+            15: "third",
+            17: "final"
+        }
+        
+        notification_type = notification_types.get(current_hour)
+        if not notification_type:
+            return
+        
+        logger.info(f"Sending {notification_type} daily reminder at {current_hour}:00")
+        
+        # Get users without targets today
+        users_without_target = db.get_users_without_target_today(today)
+        
+        if not users_without_target:
+            logger.info("All users have uploaded targets today.")
+            return
+        
+        sent_count = 0
+        failed_count = 0
+        
+        for user in users_without_target:
+            try:
+                # Check if notification was already sent to this user today
+                notifications_sent = user.get("notifications_sent", [])
+                if any(n.get("type") == notification_type for n in notifications_sent):
+                    continue  # Skip if already sent this notification type
+                
+                # Send DM reminder
+                message_text = ""
+                if notification_type == "first":
+                    message_text = (
+                        "📢 **Good Morning!**\n\n"
+                        "This is your first reminder to upload your daily study target.\n\n"
+                        "Please set your target using:\n"
+                        "`/settarget <your target description>`\n\n"
+                        "⏰ **Reminder Schedule:**\n"
+                        "• 9 AM: First reminder (this one)\n"
+                        "• 12 PM: Second reminder\n"
+                        "• 3 PM: Third reminder\n"
+                        "• 5 PM: Final reminder & absent marking\n\n"
+                        "Don't forget to set your target! 📚"
+                    )
+                elif notification_type == "second":
+                    message_text = (
+                        "📢 **Midday Reminder!**\n\n"
+                        "This is your second reminder to upload your daily study target.\n\n"
+                        "Please set your target using:\n"
+                        "`/settarget <your target description>`\n\n"
+                        "⏰ **Remaining Schedule:**\n"
+                        "• 3 PM: Third reminder\n"
+                        "• 5 PM: Final reminder & absent marking\n\n"
+                        "Please don't delay! ⏳"
+                    )
+                elif notification_type == "third":
+                    message_text = (
+                        "📢 **Afternoon Reminder!**\n\n"
+                        "This is your third reminder to upload your daily study target.\n\n"
+                        "Please set your target using:\n"
+                        "`/settarget <your target description>`\n\n"
+                        "⚠️ **Final Warning:**\n"
+                        "• 5 PM: Final reminder & absent marking\n\n"
+                        "This is your last chance before being marked absent! 🚨"
+                    )
+                elif notification_type == "final":
+                    message_text = (
+                        "📢 **FINAL REMINDER!**\n\n"
+                        "This is your final reminder to upload your daily study target.\n\n"
+                        "You have until the end of the day to set your target using:\n"
+                        "`/settarget <your target description>`\n\n"
+                        "🚨 **IMPORTANT:**\n"
+                        "If you don't set a target by the end of today, you will be marked as **ABSENT**.\n\n"
+                        "This is your last chance! ⚠️"
+                    )
+                
+                # Send DM to user
+                await context.bot.send_message(
+                    chat_id=user["user_id"],
+                    text=message_text,
+                    parse_mode='Markdown'
+                )
+                
+                # Record notification in database
+                db.record_notification_sent(user["user_id"], today, notification_type)
+                
+                sent_count += 1
+                logger.info(f"Sent {notification_type} reminder to user {user['user_id']}")
+                
+                # Avoid rate limiting
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Failed to send reminder to user {user['user_id']}: {e}")
+                continue
+        
+        logger.info(f"Sent {sent_count} reminders, failed: {failed_count}")
+        
+        # If this is the final notification (5 PM), mark users as absent
+        if notification_type == "final":
+            await mark_absent_users(context, today)
+            
+    except Exception as e:
+        logger.error(f"Error in daily reminders: {e}")
+
+# Mark users as absent
+async def mark_absent_users(context: ContextTypes.DEFAULT_TYPE, today: date):
+    """Mark users as absent who haven't uploaded targets"""
+    try:
+        logger.info("Marking absent users for today...")
+        
+        # Get users without targets today (after final reminder)
+        users_without_target = db.get_users_without_target_today(today)
+        
+        if not users_without_target:
+            logger.info("No users to mark as absent.")
+            return
+        
+        absent_count = 0
+        for user in users_without_target:
+            try:
+                # Mark user as absent
+                db.mark_user_absent(
+                    user["user_id"], 
+                    today, 
+                    "No daily target submitted"
+                )
+                
+                # Send absent notification to user
+                absent_message = (
+                    "📋 **Daily Attendance Report**\n\n"
+                    "❌ You have been marked as **ABSENT** for today.\n\n"
+                    "**Reason:** No daily study target submitted.\n\n"
+                    "**Reminder:** Please make sure to set your daily target before 5 PM tomorrow to avoid being marked absent again.\n\n"
+                    "To set a target, use:\n"
+                    "`/settarget <your target description>`\n\n"
+                    "Stay consistent with your studies! 📚"
+                )
+                
+                await context.bot.send_message(
+                    chat_id=user["user_id"],
+                    text=absent_message,
+                    parse_mode='Markdown'
+                )
+                
+                absent_count += 1
+                logger.info(f"Marked user {user['user_id']} as absent")
+                
+                # Avoid rate limiting
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Failed to mark user {user['user_id']} as absent: {e}")
+                continue
+        
+        # Send summary to admin
+        try:
+            admin_message = (
+                f"📊 **Daily Attendance Summary**\n\n"
+                f"**Date:** {today.strftime('%Y-%m-%d')}\n"
+                f"**Total Absent:** {absent_count}\n"
+                f"**Total Present:** {len(users_without_target) - absent_count}\n\n"
+                f"Absent marking completed successfully. ✅"
+            )
+            
+            await context.bot.send_message(
+                chat_id=int(ADMIN_USER_ID),
+                text=admin_message,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Failed to send admin summary: {e}")
+        
+        logger.info(f"Marked {absent_count} users as absent for {today}")
+        
+    except Exception as e:
+        logger.error(f"Error marking absent users: {e}")
+
+# Command to check daily status
+async def daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check user's daily status"""
+    if not is_allowed_group(update.effective_chat.id):
+        return
+    
+    user_id = update.effective_user.id
+    today = date.today()
+    
+    # Get user's daily status
+    status = db.get_user_daily_status(user_id, today)
+    
+    # Get user's targets for today
+    user_targets = db.get_user_targets(user_id)
+    today_targets = [
+        target for target in user_targets 
+        if target.get("created_at") and target["created_at"].date() == today
+    ]
+    
+    # Build status message
+    message = f"📊 **Daily Status for {today.strftime('%Y-%m-%d')}**\n\n"
+    
+    if status["has_target"] or today_targets:
+        message += "✅ **Status:** PRESENT\n"
+        message += f"📚 **Targets Today:** {len(today_targets)}\n\n"
+        
+        if today_targets:
+            message += "**Your targets today:**\n"
+            for i, target in enumerate(today_targets[:3], 1):  # Show first 3 targets
+                progress = target.get("progress", 0)
+                message += f"{i}. {target['target'][:50]}... - {progress}%\n"
+            
+            if len(today_targets) > 3:
+                message += f"... and {len(today_targets) - 3} more\n"
+    else:
+        message += "❌ **Status:** NO TARGET YET\n\n"
+        
+        # Show notifications sent
+        notifications = status.get("notifications_sent", [])
+        if notifications:
+            message += "**Reminders received:**\n"
+            for note in notifications[-3:]:  # Show last 3 notifications
+                note_time = note.get("sent_at", datetime.now())
+                if isinstance(note_time, str):
+                    note_time = datetime.fromisoformat(note_time)
+                message += f"• {note_time.strftime('%I:%M %p')} - {note['type'].title()} reminder\n"
+        
+        if status["marked_absent"]:
+            message += f"\n⚠️ **Absent Marked:** {status['absent_reason']}\n"
+        else:
+            # Show next reminder time
+            current_hour = datetime.now().hour
+            next_reminder = None
+            
+            for hour in NOTIFICATION_TIMES:
+                if hour > current_hour:
+                    next_reminder = hour
+                    break
+            
+            if next_reminder:
+                message += f"\n⏰ **Next reminder:** {next_reminder}:00\n"
+    
+    # Add instructions
+    message += "\n---\n"
+    message += "**Commands:**\n"
+    message += "• `/settarget <description>` - Set daily target\n"
+    message += "• `/mytargets` - View all your targets\n"
+    message += "• `/dailystatus` - Check this status again\n"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+# Admin command to view daily attendance
+async def attendance_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: View daily attendance report"""
+    if not is_allowed_group(update.effective_chat.id):
+        return
+    
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("This command is for admins only.")
+        return
+    
+    today = date.today()
+    
+    # Get all registered users
+    registered_users = list(db.registrations.find(
+        {"group_id": int(ALLOWED_GROUP_ID), "status": "accepted"}
+    ))
+    
+    if not registered_users:
+        await update.message.reply_text("No registered users found.")
+        return
+    
+    # Count attendance
+    present_count = 0
+    absent_count = 0
+    
+    attendance_list = []
+    
+    for user in registered_users:
+        user_id = user["user_id"]
+        username = user.get("username", "Unknown")
+        
+        # Get user's daily status
+        status = db.get_user_daily_status(user_id, today)
+        
+        # Check if user has any targets today
+        user_targets = db.get_user_targets(user_id)
+        has_target_today = any(
+            target.get("created_at") and target["created_at"].date() == today
+            for target in user_targets
+        )
+        
+        if has_target_today or status["has_target"]:
+            status_text = "✅ PRESENT"
+            present_count += 1
+        elif status["marked_absent"]:
+            status_text = "❌ ABSENT"
+            absent_count += 1
+        else:
+            status_text = "⏳ PENDING"
+        
+        attendance_list.append(f"{status_text} - @{username}")
+    
+    # Create report
+    report = (
+        f"📊 **Daily Attendance Report**\n\n"
+        f"**Date:** {today.strftime('%Y-%m-%d')}\n"
+        f"**Total Users:** {len(registered_users)}\n"
+        f"**✅ Present:** {present_count}\n"
+        f"**❌ Absent:** {absent_count}\n"
+        f"**⏳ Pending:** {len(registered_users) - present_count - absent_count}\n\n"
+        f"**Attendance List:**\n"
+    )
+    
+    # Add attendance list (limited to first 20 users)
+    for i, entry in enumerate(attendance_list[:20], 1):
+        report += f"{i}. {entry}\n"
+    
+    if len(attendance_list) > 20:
+        report += f"\n... and {len(attendance_list) - 20} more users\n"
+    
+    # Add summary
+    report += f"\n**Next reminder:** {NOTIFICATION_TIMES[0]}:00 AM"
+    
+    await update.message.reply_text(report, parse_mode='Markdown')
+
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -275,7 +614,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "4. **No Harassment**: Any form of harassment will result in immediate ban.\n"
             "5. **Follow Guidelines**: Adhere to group-specific guidelines.\n"
             "6. **Help Others**: Share knowledge and help fellow students.\n"
-            "7. **Report Issues**: Report any problems to admins.\n\n"
+            "7. **Report Issues**: Report any problems to admins.\n"
+            "8. **Daily Targets**: Upload your study target every day before 5 PM.\n\n"
             "By accepting, you agree to follow these rules."
         )
         
@@ -296,6 +636,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_message = (
             f"👋 Hello {user.first_name}!\n\n"
             "I'm the Study Bot. I help manage study targets and group registrations.\n\n"
+            "**Daily Target Reminders:**\n"
+            "• 9 AM: First reminder\n"
+            "• 12 PM: Second reminder\n"
+            "• 3 PM: Third reminder\n"
+            "• 5 PM: Final reminder & absent marking\n\n"
+            "**Important:** Upload your daily target before 5 PM to avoid being marked absent.\n\n"
             "If you were asked to register for a group, please use the registration link provided in the group.\n\n"
             "Commands available in group:\n"
             "/settarget - Set a new study target\n"
@@ -303,19 +649,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/progress - Update target progress\n"
             "/completed - Mark target as completed\n"
             "/stats - View your study statistics\n"
+            "/dailystatus - Check your daily status\n"
             "/help - Show help message"
         )
         await update.message.reply_text(welcome_message)
     elif is_allowed_group(update.effective_chat.id):
         welcome_message = (
             f"🎯 Welcome {user.first_name} to Study Target Bot!\n\n"
-            "I help you track your study targets and progress.\n\n"
+            "**📢 IMPORTANT DAILY REMINDERS:**\n"
+            "• 9 AM: First reminder\n"
+            "• 12 PM: Second reminder\n"
+            "• 3 PM: Third reminder\n"
+            "• 5 PM: Final reminder & absent marking\n\n"
+            "**⚠️ You must upload your daily study target before 5 PM to avoid being marked absent.**\n\n"
             "📚 Available Commands:\n"
             "/settarget - Set a new study target\n"
             "/mytargets - View your current targets\n"
             "/progress - Update target progress\n"
             "/completed - Mark target as completed\n"
             "/stats - View your study statistics\n"
+            "/dailystatus - Check your daily status\n"
             "/help - Show help message\n"
         )
         await update.message.reply_text(welcome_message)
@@ -346,6 +699,10 @@ async def accept_rules_callback(update: Update, context: ContextTypes.DEFAULT_TY
             "✅ **Registration Successful!**\n\n"
             "You have been unmuted in the group.\n"
             "You can now participate in discussions.\n\n"
+            "**📢 IMPORTANT:**\n"
+            "• You must upload a daily study target before 5 PM\n"
+            "• Reminders will be sent at 9 AM, 12 PM, 3 PM, and 5 PM\n"
+            "• Missing targets will result in being marked absent\n\n"
             "Welcome to our study community! 🎓",
             parse_mode='Markdown'
         )
@@ -355,7 +712,8 @@ async def accept_rules_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_message(
                 chat_id=int(ALLOWED_GROUP_ID),
                 text=f"🎉 Welcome @{query.from_user.username or query.from_user.first_name} to our study group!\n"
-                     "Your registration is complete. Happy studying! 📚"
+                     "Your registration is complete. Happy studying! 📚\n\n"
+                     "**Reminder:** Don't forget to upload your daily study target!"
             )
         except Exception as e:
             logger.error(f"Failed to send group message: {e}")
@@ -634,6 +992,14 @@ async def view_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     stats = db.get_user_stats(user_id)
     
+    # Get daily attendance stats
+    today = date.today()
+    daily_status = db.get_user_daily_status(user_id, today)
+    
+    attendance_status = "✅ Present" if daily_status["has_target"] else "❌ No target yet"
+    if daily_status["marked_absent"]:
+        attendance_status = "🚫 Absent"
+    
     message = (
         f"📊 Study Statistics for @{update.effective_user.username or update.effective_user.first_name}\n\n"
         f"🎯 Total Targets: {stats['total_targets']}\n"
@@ -641,7 +1007,10 @@ async def view_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Active: {stats['active_targets']}\n"
         f"📈 Completion Rate: {stats['completion_rate']}%\n"
         f"🔥 Current Streak: {stats['current_streak']} days\n"
-        f"🏆 Best Streak: {stats['best_streak']} days"
+        f"🏆 Best Streak: {stats['best_streak']} days\n\n"
+        f"📅 **Today's Status ({today.strftime('%Y-%m-%d')}):**\n"
+        f"• Attendance: {attendance_status}\n"
+        f"• Reminders: {len(daily_status['notifications_sent'])}/4\n"
     )
     
     await update.message.reply_text(message)
@@ -662,21 +1031,28 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📚 Study Bot Help\n\n"
-        "Commands:\n"
+        "**Daily Target System:**\n"
+        "• 9 AM: First reminder\n"
+        "• 12 PM: Second reminder\n"
+        "• 3 PM: Third reminder\n"
+        "• 5 PM: Final reminder & absent marking\n\n"
+        "**Commands:**\n"
         "/start - Start the bot\n"
         "/settarget <description> - Set a new study target\n"
         "/mytargets - View your current targets\n"
         "/progress <id> <percentage> - Update target progress\n"
         "/completed <id> - Mark target as completed\n"
         "/stats - View your study statistics\n"
+        "/dailystatus - Check your daily attendance status\n"
+        "/attendance - Admin: View daily attendance report\n"
         "/export - Admin: Export all data (admin only)\n"
         "/checkmembers - Admin: Check and register existing members\n"
         "/registeruser - Admin: Manually register a user\n"
         "/help - Show this help message\n\n"
-        "Tips:\n"
+        "**Tips:**\n"
         "• Set realistic targets\n"
         "• Update progress regularly\n"
-        "• Celebrate completed targets!\n"
+        "• Upload daily target before 5 PM\n"
         "• Use partial target IDs (first 8 characters) for commands"
     )
     
@@ -739,6 +1115,35 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+# Scheduler for daily reminders
+def setup_scheduler(application):
+    """Setup the scheduler for daily reminders"""
+    # Create job queue
+    job_queue = application.job_queue
+    
+    if job_queue:
+        # Schedule reminders at specified times
+        for hour in NOTIFICATION_TIMES:
+            job_queue.run_daily(
+                send_daily_reminders,
+                time=datetime.strptime(f"{hour:02d}:00", "%H:%M").time(),
+                days=(0, 1, 2, 3, 4, 5, 6),
+                name=f"daily_reminder_{hour}"
+            )
+            logger.info(f"Scheduled daily reminder at {hour}:00")
+        
+        # Schedule a daily reset at midnight
+        job_queue.run_daily(
+            lambda context: logger.info("Daily reset triggered"),
+            time=datetime.strptime("00:00", "%H:%M").time(),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="daily_reset"
+        )
+        
+        logger.info("Scheduler setup complete")
+    else:
+        logger.warning("Job queue not available for scheduler")
+
 # Heartbeat function
 def send_heartbeat():
     """Send periodic heartbeat to keep the bot alive"""
@@ -777,11 +1182,28 @@ async def mark_completed_wrapper(update: Update, context: ContextTypes.DEFAULT_T
 async def view_stats_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await check_registration_and_execute(update, context, view_stats)
 
+async def daily_status_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, daily_status)
+
+async def attendance_report_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, attendance_report)
+
 async def export_data_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await check_registration_and_execute(update, context, export_data)
 
 async def help_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await check_registration_and_execute(update, context, help_command)
+
+# Test command for manual reminder trigger
+async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test command to trigger reminders manually (admin only)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("This command is for admins only.")
+        return
+    
+    await update.message.reply_text("🔔 Testing reminder system...")
+    await send_daily_reminders(context)
+    await update.message.reply_text("✅ Reminder test completed.")
 
 # Main function
 def main():
@@ -801,6 +1223,9 @@ def main():
     # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
+    # Setup scheduler for daily reminders
+    setup_scheduler(application)
+    
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(
@@ -813,8 +1238,11 @@ def main():
     application.add_handler(CommandHandler("progress", update_progress_wrapper))
     application.add_handler(CommandHandler("completed", mark_completed_wrapper))
     application.add_handler(CommandHandler("stats", view_stats_wrapper))
+    application.add_handler(CommandHandler("dailystatus", daily_status_wrapper))
+    application.add_handler(CommandHandler("attendance", attendance_report_wrapper))
     application.add_handler(CommandHandler("export", export_data_wrapper))
     application.add_handler(CommandHandler("help", help_command_wrapper))
+    application.add_handler(CommandHandler("testreminder", test_reminder))
     application.add_handler(CommandHandler("registeruser", register_user))
     application.add_handler(CallbackQueryHandler(deadline_callback, pattern="^deadline_"))
     application.add_handler(CallbackQueryHandler(accept_rules_callback, pattern="^accept_rules_"))
@@ -826,6 +1254,7 @@ def main():
     print("Bot is starting...")
     print(f"Bot status: {bot_status}")
     print(f"Flask server running on port {PORT}")
+    print(f"Daily reminders scheduled at: {', '.join(str(h) + ':00' for h in NOTIFICATION_TIMES)}")
     
     try:
         application.run_polling(
