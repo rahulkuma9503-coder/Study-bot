@@ -14,6 +14,7 @@ class MongoDB:
         self.stats = self.db.stats
         self.registrations = self.db.registrations
         self.group_members = self.db.group_members
+        self.daily_activity = self.db.daily_activity  # New collection for daily activity tracking
         
         # Drop problematic unique index if it exists
         self._cleanup_problematic_indexes()
@@ -67,6 +68,11 @@ class MongoDB:
         
         # Create indexes for group members
         self.group_members.create_index([("user_id", ASCENDING), ("group_id", ASCENDING)])
+        
+        # Create indexes for daily activity
+        self.daily_activity.create_index([("user_id", ASCENDING)])
+        self.daily_activity.create_index([("date", ASCENDING)])
+        self.daily_activity.create_index([("user_id", ASCENDING), ("date", ASCENDING)])
     
     def add_target(self, target_data: Dict) -> str:
         """Add a new study target"""
@@ -86,6 +92,12 @@ class MongoDB:
                 target_data["sequence_number"] = 1
             
             result = self.targets.insert_one(target_data)
+            
+            # Update daily activity
+            if result.inserted_id:
+                today = datetime.now().date()
+                self.update_daily_activity(target_data["user_id"], today, has_target=True)
+            
             return str(result.inserted_id)
         except DuplicateKeyError as e:
             print(f"Duplicate key error: {e}")
@@ -353,6 +365,120 @@ class MongoDB:
         except Exception as e:
             print(f"Error checking existing members: {e}")
             return []
+    
+    # Daily activity tracking methods
+    def update_daily_activity(self, user_id: int, date: datetime.date, has_target: bool = False):
+        """Update daily activity for a user"""
+        try:
+            activity_data = {
+                "user_id": user_id,
+                "date": date,
+                "has_target_today": has_target,
+                "last_updated": datetime.now(),
+                "notifications_sent": [],
+                "marked_absent": False,
+                "absent_reason": ""
+            }
+            
+            self.daily_activity.update_one(
+                {"user_id": user_id, "date": date},
+                {"$set": activity_data},
+                upsert=True
+            )
+        except Exception as e:
+            print(f"Error updating daily activity: {e}")
+    
+    def get_users_without_target_today(self, date: datetime.date) -> List[Dict]:
+        """Get all users who haven't set a target today"""
+        try:
+            # Get all registered users for the group
+            registered_users = list(self.registrations.find(
+                {"group_id": int(ALLOWED_GROUP_ID), "status": "accepted"}
+            ))
+            
+            users_without_target = []
+            for user in registered_users:
+                user_id = user["user_id"]
+                
+                # Check if user has target today
+                activity = self.daily_activity.find_one(
+                    {"user_id": user_id, "date": date}
+                )
+                
+                if not activity or not activity.get("has_target_today", False):
+                    users_without_target.append({
+                        "user_id": user_id,
+                        "username": user.get("username", "Unknown"),
+                        "notifications_sent": activity.get("notifications_sent", []) if activity else []
+                    })
+            
+            return users_without_target
+        except Exception as e:
+            print(f"Error getting users without target: {e}")
+            return []
+    
+    def record_notification_sent(self, user_id: int, date: datetime.date, notification_type: str):
+        """Record that a notification was sent to a user"""
+        try:
+            self.daily_activity.update_one(
+                {"user_id": user_id, "date": date},
+                {
+                    "$push": {"notifications_sent": {
+                        "type": notification_type,
+                        "sent_at": datetime.now()
+                    }},
+                    "$set": {"last_notification": datetime.now()}
+                },
+                upsert=True
+            )
+        except Exception as e:
+            print(f"Error recording notification: {e}")
+    
+    def mark_user_absent(self, user_id: int, date: datetime.date, reason: str = "No target submitted"):
+        """Mark user as absent for the day"""
+        try:
+            self.daily_activity.update_one(
+                {"user_id": user_id, "date": date},
+                {
+                    "$set": {
+                        "marked_absent": True,
+                        "absent_reason": reason,
+                        "absent_marked_at": datetime.now()
+                    }
+                },
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            print(f"Error marking user absent: {e}")
+            return False
+    
+    def get_user_daily_status(self, user_id: int, date: datetime.date) -> Dict:
+        """Get user's daily status"""
+        try:
+            activity = self.daily_activity.find_one({"user_id": user_id, "date": date})
+            if activity:
+                return {
+                    "has_target": activity.get("has_target_today", False),
+                    "notifications_sent": activity.get("notifications_sent", []),
+                    "marked_absent": activity.get("marked_absent", False),
+                    "absent_reason": activity.get("absent_reason", "")
+                }
+            else:
+                return {
+                    "has_target": False,
+                    "notifications_sent": [],
+                    "marked_absent": False,
+                    "absent_reason": ""
+                }
+        except Exception as e:
+            print(f"Error getting user daily status: {e}")
+            return {
+                "has_target": False,
+                "notifications_sent": [],
+                "marked_absent": False,
+                "absent_reason": ""
+            }
     
     def export_all_data(self) -> List[Dict]:
         """Export all data for backup"""
