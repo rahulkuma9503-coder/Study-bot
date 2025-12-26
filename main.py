@@ -65,10 +65,11 @@ def is_allowed_group(chat_id: str) -> bool:
 def is_admin(user_id: str) -> bool:
     return str(user_id) == ADMIN_USER_ID
 
-# Mute user in group
+# FIXED: Mute user in group with proper permissions
 async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, reason: str = "Not registered"):
-    """Mute a user in the group"""
+    """Mute a user in the group - FIXED VERSION"""
     try:
+        # Create restrictive permissions
         permissions = ChatPermissions(
             can_send_messages=False,
             can_send_media_messages=False,
@@ -80,22 +81,46 @@ async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TY
             can_pin_messages=False
         )
         
+        # First try to get chat member to check if user exists
+        try:
+            await context.bot.get_chat_member(chat_id, user_id)
+        except Exception as e:
+            logger.warning(f"User {user_id} not found in chat {chat_id}: {e}")
+            return False
+        
+        # Try to restrict user - use until_date for 24 hours
         await context.bot.restrict_chat_member(
             chat_id=chat_id,
             user_id=user_id,
             permissions=permissions,
-            until_date=datetime.now() + timedelta(days=365)
+            until_date=datetime.now() + timedelta(days=1)  # 24 hours mute
         )
-        logger.info(f"Muted user {user_id} in group {chat_id}: {reason}")
+        
+        logger.info(f"✅ Successfully muted user {user_id} in group {chat_id}: {reason}")
         return True
+        
     except Exception as e:
-        logger.error(f"Failed to mute user {user_id}: {e}")
+        logger.error(f"❌ Failed to mute user {user_id}: {str(e)}")
+        
+        # Check for specific errors
+        if "Not enough rights" in str(e) or "administrator" in str(e).lower():
+            logger.error(f"⚠️ Bot needs admin permissions with 'Restrict members' rights!")
+            logger.error(f"⚠️ Please make bot admin with these permissions:")
+            logger.error(f"   - Delete messages")
+            logger.error(f"   - Ban users / Restrict members")
+            logger.error(f"   - Invite users")
+        elif "USER_NOT_PARTICIPANT" in str(e):
+            logger.error(f"⚠️ User {user_id} is not a participant in the group")
+        elif "CHAT_ADMIN_REQUIRED" in str(e):
+            logger.error(f"⚠️ Bot needs admin rights to mute users")
+        
         return False
 
-# Unmute user in group
+# FIXED: Unmute user in group
 async def unmute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Unmute a user in the group"""
+    """Unmute a user in the group - FIXED VERSION"""
     try:
+        # Create normal permissions
         permissions = ChatPermissions(
             can_send_messages=True,
             can_send_media_messages=True,
@@ -107,15 +132,39 @@ async def unmute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_
             can_pin_messages=False
         )
         
+        # Check if user exists in chat
+        try:
+            await context.bot.get_chat_member(chat_id, user_id)
+        except Exception as e:
+            logger.warning(f"User {user_id} not found in chat {chat_id}: {e}")
+            return False
+        
+        # Restore permissions
         await context.bot.restrict_chat_member(
             chat_id=chat_id,
             user_id=user_id,
             permissions=permissions
         )
-        logger.info(f"Unmuted user {user_id} in group {chat_id}")
+        
+        logger.info(f"✅ Successfully unmuted user {user_id} in group {chat_id}")
         return True
+        
     except Exception as e:
-        logger.error(f"Failed to unmute user {user_id}: {e}")
+        logger.error(f"❌ Failed to unmute user {user_id}: {str(e)}")
+        
+        if "Not enough rights" in str(e) or "administrator" in str(e).lower():
+            logger.error(f"⚠️ Bot needs admin permissions to unmute users")
+        
+        return False
+
+# Check if bot has admin permissions
+async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    """Check if bot has admin permissions"""
+    try:
+        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        return bot_member.status in ['administrator', 'creator']
+    except Exception as e:
+        logger.error(f"Error checking bot admin status: {e}")
         return False
 
 # Send registration prompt
@@ -156,42 +205,59 @@ async def send_registration_prompt(chat_id: int, user_id: int, username: str, co
         logger.error(f"Failed to send registration prompt to {user_id}: {e}")
         return False
 
-# Handler for new members joining the group
+# Handler for new members joining the group - FIXED
 async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new members joining the group"""
+    """Handle new members joining the group - FIXED VERSION"""
     if not is_allowed_group(update.effective_chat.id):
         return
     
     if update.effective_chat.type not in ['group', 'supergroup']:
         return
     
+    # Check if bot is admin
+    is_bot_admin = await check_bot_admin_status(context, update.effective_chat.id)
+    if not is_bot_admin:
+        logger.error("❌ Bot is not admin! Cannot mute new members.")
+        return
+    
     for member in update.message.new_chat_members:
         user_id = member.id
         username = member.username or member.first_name
         
+        # Skip if it's the bot itself
         if member.id == context.bot.id:
             continue
         
         db.add_group_member(user_id, update.effective_chat.id, username)
         
+        # Check if user is already registered
         if db.is_user_registered(user_id, update.effective_chat.id):
             await update.message.reply_text(
                 f"Welcome back, @{username}! You're already registered."
             )
             continue
         
-        await mute_user(update.effective_chat.id, user_id, context, "New member registration required")
+        # Mute the new member
+        mute_success = await mute_user(update.effective_chat.id, user_id, context, "New member registration required")
         
-        await send_registration_prompt(
-            update.effective_chat.id, 
-            user_id, 
-            username, 
-            context
-        )
+        if mute_success:
+            logger.info(f"✅ New member {username} (ID: {user_id}) muted successfully")
+            # Send registration prompt
+            await send_registration_prompt(
+                update.effective_chat.id, 
+                user_id, 
+                username, 
+                context
+            )
+        else:
+            logger.error(f"❌ Failed to mute new member {username} (ID: {user_id})")
+            await update.message.reply_text(
+                f"⚠️ Failed to mute @{username}. Bot may not have admin permissions."
+            )
 
-# Handler for ALL messages - CHECK AND MUTE UNREGISTERED USERS
+# FIXED: Handler for ALL messages - CHECK AND MUTE UNREGISTERED USERS
 async def check_and_mute_unregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check all messages and mute unregistered users"""
+    """Check all messages and mute unregistered users - FIXED VERSION"""
     if not is_allowed_group(update.effective_chat.id):
         return
     
@@ -212,42 +278,57 @@ async def check_and_mute_unregistered(update: Update, context: ContextTypes.DEFA
     
     # Check if user is registered
     if not db.is_user_registered(user_id, chat_id):
+        # Check if bot is admin
+        is_bot_admin = await check_bot_admin_status(context, chat_id)
+        if not is_bot_admin:
+            logger.error("❌ Bot is not admin! Cannot mute user.")
+            return
+        
         # Mute the user
-        await mute_user(chat_id, user_id, context, "Unregistered user tried to send message")
+        mute_success = await mute_user(chat_id, user_id, context, "Unregistered user tried to send message")
         
-        # Get or create registration
-        registration = db.get_registration_status(user_id, chat_id)
-        if not registration:
-            registration_id = db.add_registration(user_id, chat_id, username)
-        else:
-            registration_id = str(registration.get('_id', ''))
-        
-        # Send registration prompt
-        keyboard = [[
-            InlineKeyboardButton(
-                "📝 Register Now", 
-                url=f"https://t.me/{context.bot.username}?start=register_{registration_id}"
+        if mute_success:
+            # Get or create registration
+            registration = db.get_registration_status(user_id, chat_id)
+            if not registration:
+                registration_id = db.add_registration(user_id, chat_id, username)
+            else:
+                registration_id = str(registration.get('_id', ''))
+            
+            # Send registration prompt
+            keyboard = [[
+                InlineKeyboardButton(
+                    "📝 Register Now", 
+                    url=f"https://t.me/{context.bot.username}?start=register_{registration_id}"
+                )
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            warning_message = (
+                f"⚠️ @{username}, you are not registered!\n\n"
+                "You have been muted until you complete registration.\n"
+                "Click the button below to register and get unmuted."
             )
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        warning_message = (
-            f"⚠️ @{username}, you are not registered!\n\n"
-            "You have been muted until you complete registration.\n"
-            "Click the button below to register and get unmuted."
-        )
-        
-        await update.message.reply_text(
-            warning_message,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-        # Try to delete the user's message
-        try:
-            await update.message.delete()
-        except Exception as e:
-            logger.error(f"Could not delete message: {e}")
+            
+            await update.message.reply_text(
+                warning_message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            
+            # Try to delete the user's message
+            try:
+                await update.message.delete()
+                logger.info(f"✅ Deleted message from unregistered user {username}")
+            except Exception as e:
+                logger.error(f"Could not delete message: {e}")
+        else:
+            # If mute failed, at least delete the message
+            try:
+                await update.message.delete()
+                logger.info(f"✅ Deleted message from unregistered user {username} (mute failed)")
+            except Exception as e:
+                logger.error(f"Could not delete message: {e}")
 
 # Command to check and register existing members
 async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -460,6 +541,7 @@ async def mark_absent_users(context: ContextTypes.DEFAULT_TYPE, today: date):
                 logger.error(f"Failed to mark user {user['user_id']} as absent: {e}")
                 continue
         
+        # Send summary to admin
         try:
             admin_message = (
                 f"📊 **Daily Attendance Summary**\n\n"
@@ -1183,6 +1265,33 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_daily_reminders(context)
     await update.message.reply_text("✅ Reminder test completed.")
 
+# New command: Check bot admin status
+async def bot_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check if bot has admin permissions"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("This command is for admins only.")
+        return
+    
+    chat_id = update.effective_chat.id
+    is_bot_admin = await check_bot_admin_status(context, chat_id)
+    
+    if is_bot_admin:
+        await update.message.reply_text("✅ Bot has admin permissions in this group!")
+    else:
+        await update.message.reply_text(
+            "❌ Bot is NOT an admin in this group!\n\n"
+            "⚠️ **Please make the bot admin with these permissions:**\n"
+            "• Delete messages\n"
+            "• Ban users / Restrict members\n"
+            "• Invite users via link\n"
+            "• Pin messages\n"
+            "• Manage video chats\n\n"
+            "Without admin rights, the bot cannot:\n"
+            "• Mute unregistered users\n"
+            "• Delete messages\n"
+            "• Manage group properly"
+        )
+
 # Main function
 def main():
     bot_status["is_running"] = True
@@ -1201,7 +1310,7 @@ def main():
     
     # Add handlers - CRITICAL: Add message handler for ALL messages first
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
+        filters.ChatType.GROUPS & ~filters.COMMAND, 
         check_and_mute_unregistered
     ))
     
@@ -1221,17 +1330,28 @@ def main():
     application.add_handler(CommandHandler("export", export_data_wrapper))
     application.add_handler(CommandHandler("help", help_command_wrapper))
     application.add_handler(CommandHandler("testreminder", test_reminder))
+    application.add_handler(CommandHandler("botstatus", bot_status_command))
     application.add_handler(CommandHandler("registeruser", register_user))
     application.add_handler(CallbackQueryHandler(deadline_callback, pattern="^deadline_"))
     application.add_handler(CallbackQueryHandler(accept_rules_callback, pattern="^accept_rules_"))
     
     application.add_error_handler(error_handler)
     
-    print("Bot is starting...")
-    print(f"Bot status: {bot_status}")
-    print(f"Flask server running on port {PORT}")
-    print(f"Daily reminders scheduled at: {', '.join(str(h) + ':00' for h in NOTIFICATION_TIMES)}")
-    print("✅ Bot will now mute unregistered users when they send messages!")
+    print("=" * 60)
+    print("🤖 Study Bot Starting...")
+    print("=" * 60)
+    print(f"📱 Bot status: {bot_status}")
+    print(f"🌐 Flask server running on port {PORT}")
+    print(f"⏰ Daily reminders scheduled at: {', '.join(str(h) + ':00' for h in NOTIFICATION_TIMES)}")
+    print("\n⚠️ **IMPORTANT:** Make sure the bot has ADMIN permissions in your group!")
+    print("   Required permissions:")
+    print("   • Delete messages")
+    print("   • Ban users / Restrict members")
+    print("   • Invite users via link")
+    print("   • Pin messages")
+    print("   • Manage video chats")
+    print("\n✅ Use /botstatus command to check if bot has admin permissions")
+    print("=" * 60)
     
     try:
         application.run_polling(
