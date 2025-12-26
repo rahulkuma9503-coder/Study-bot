@@ -1,8 +1,7 @@
 services:
   - type: web
-    name: telegram-study-bot
+    name: study-bot
     env: python
-    region: singapore
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
@@ -12,11 +11,9 @@ services:
         sync: false
       - key: ADMIN_USER_ID
         sync: false
-      - key: GROUP_LINK
-        sync: false
       - key: MONGODB_URI
         sync: false
       - key: PORT
         value: 10000
-    healthCheckPath: /
+    healthCheckPath: /health
     autoDeploy: true
