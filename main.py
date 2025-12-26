@@ -3,10 +3,11 @@ import logging
 from typing import Dict, List
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, filters, ContextTypes
+    CallbackQueryHandler, filters, ContextTypes,
+    ConversationHandler
 )
 from database import MongoDB
 
@@ -18,6 +19,9 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ALLOWED_GROUP_ID = os.getenv('ALLOWED_GROUP_ID')  # Your group ID
 ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')  # Your user ID
 MONGODB_URI = os.getenv('MONGODB_URI')
+
+# Conversation states
+RULES, ACCEPT = range(2)
 
 # Initialize MongoDB
 db = MongoDB(MONGODB_URI)
@@ -37,31 +41,273 @@ def is_allowed_group(chat_id: str) -> bool:
 def is_admin(user_id: str) -> bool:
     return str(user_id) == ADMIN_USER_ID
 
-# Start command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed_group(update.effective_chat.id):
-        return
-    
-    user = update.effective_user
-    welcome_message = (
-        f"🎯 Welcome {user.first_name} to Study Target Bot!\n\n"
-        "I help you track your study targets and progress.\n\n"
-        "📚 Available Commands:\n"
-        "/settarget - Set a new study target\n"
-        "/mytargets - View your current targets\n"
-        "/progress - Update target progress\n"
-        "/completed - Mark target as completed\n"
-        "/stats - View your study statistics\n"
-        "/help - Show help message\n"
-    )
-    
-    await update.message.reply_text(welcome_message)
+# Mute user in group
+async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Mute a user in the group"""
+    try:
+        permissions = ChatPermissions(
+            can_send_messages=False,
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
+            can_add_web_page_previews=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False
+        )
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=permissions,
+            until_date=datetime.now() + timedelta(days=365)  # Mute for 1 year or until registered
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to mute user {user_id}: {e}")
+        return False
 
-# Set target command
-async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Unmute user in group
+async def unmute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Unmute a user in the group"""
+    try:
+        permissions = ChatPermissions(
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False
+        )
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=permissions
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to unmute user {user_id}: {e}")
+        return False
+
+# Handler for new members joining the group
+async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new members joining the group"""
     if not is_allowed_group(update.effective_chat.id):
         return
     
+    # Check if it's a group chat
+    if update.effective_chat.type not in ['group', 'supergroup']:
+        return
+    
+    # Get new members
+    for member in update.message.new_chat_members:
+        user_id = member.id
+        username = member.username or member.first_name
+        
+        # Skip if it's the bot itself
+        if member.id == context.bot.id:
+            continue
+        
+        # Check if user is already registered
+        if db.is_user_registered(user_id, update.effective_chat.id):
+            await update.message.reply_text(
+                f"Welcome back, {username}! You're already registered."
+            )
+            continue
+        
+        # Mute the new member
+        await mute_user(update.effective_chat.id, user_id, context)
+        
+        # Add to registration database
+        registration_id = db.add_registration(user_id, update.effective_chat.id, username)
+        
+        # Create registration button
+        keyboard = [[
+            InlineKeyboardButton(
+                "📝 Register Now", 
+                url=f"https://t.me/{context.bot.username}?start=register_{registration_id}"
+            )
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send welcome message with registration button
+        welcome_message = (
+            f"👋 Welcome {username} to our study group!\n\n"
+            "📋 **Group Rules:**\n"
+            "1. Be respectful to all members\n"
+            "2. No spam or self-promotion\n"
+            "3. Stay on topic - this is a study group\n"
+            "4. Use appropriate language\n"
+            "5. Follow Telegram's Terms of Service\n\n"
+            "⚠️ **You are currently muted**\n"
+            "To participate in the group, you must complete registration.\n"
+            "Click the button below to start registration."
+        )
+        
+        await update.message.reply_text(
+            welcome_message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+# Start command - modified to handle registration
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    
+    # Check if it's a registration start
+    if context.args and context.args[0].startswith('register_'):
+        registration_id = context.args[0].replace('register_', '')
+        
+        # Show rules
+        rules_message = (
+            "📋 **Group Rules Declaration**\n\n"
+            "Please read and accept the following rules:\n\n"
+            "1. **Respect All Members**: Be polite and respectful to everyone.\n"
+            "2. **No Spam**: Do not post irrelevant content or advertisements.\n"
+            "3. **Study Focus**: Keep discussions related to learning and studies.\n"
+            "4. **No Harassment**: Any form of harassment will result in immediate ban.\n"
+            "5. **Follow Guidelines**: Adhere to group-specific guidelines.\n"
+            "6. **Help Others**: Share knowledge and help fellow students.\n"
+            "7. **Report Issues**: Report any problems to admins.\n\n"
+            "By accepting, you agree to follow these rules."
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("✅ I Accept All Rules", callback_data=f"accept_rules_{registration_id}")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            rules_message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Regular start command
+    if update.effective_chat.type == 'private':
+        welcome_message = (
+            f"👋 Hello {user.first_name}!\n\n"
+            "I'm the Study Bot. I help manage study targets and group registrations.\n\n"
+            "If you were asked to register for a group, please use the registration link provided in the group.\n\n"
+            "Commands available in group:\n"
+            "/settarget - Set a new study target\n"
+            "/mytargets - View your current targets\n"
+            "/progress - Update target progress\n"
+            "/completed - Mark target as completed\n"
+            "/stats - View your study statistics\n"
+            "/help - Show help message"
+        )
+        await update.message.reply_text(welcome_message)
+    elif is_allowed_group(update.effective_chat.id):
+        welcome_message = (
+            f"🎯 Welcome {user.first_name} to Study Target Bot!\n\n"
+            "I help you track your study targets and progress.\n\n"
+            "📚 Available Commands:\n"
+            "/settarget - Set a new study target\n"
+            "/mytargets - View your current targets\n"
+            "/progress - Update target progress\n"
+            "/completed - Mark target as completed\n"
+            "/stats - View your study statistics\n"
+            "/help - Show help message\n"
+        )
+        await update.message.reply_text(welcome_message)
+
+# Accept rules callback handler
+async def accept_rules_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle rules acceptance"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split('_')
+    if len(data) != 3:
+        await query.edit_message_text("Registration error. Please contact admin.")
+        return
+    
+    registration_id = data[2]
+    user_id = query.from_user.id
+    
+    # In a real implementation, you would verify the registration_id
+    # For now, we'll accept it
+    
+    # Mark rules as accepted in database
+    success = db.accept_rules(user_id, int(ALLOWED_GROUP_ID))
+    
+    if success:
+        # Unmute user in group
+        await unmute_user(int(ALLOWED_GROUP_ID), user_id, context)
+        
+        # Send confirmation message in private chat
+        await query.edit_message_text(
+            "✅ **Registration Successful!**\n\n"
+            "You have been unmuted in the group.\n"
+            "You can now participate in discussions.\n\n"
+            "Welcome to our study community! 🎓",
+            parse_mode='Markdown'
+        )
+        
+        # Send welcome message in group
+        try:
+            await context.bot.send_message(
+                chat_id=int(ALLOWED_GROUP_ID),
+                text=f"🎉 Welcome @{query.from_user.username or query.from_user.first_name} to our study group!\n"
+                     "Your registration is complete. Happy studying! 📚"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send group message: {e}")
+    else:
+        await query.edit_message_text(
+            "❌ Registration failed. Please contact an admin for assistance."
+        )
+
+# Modified command handlers to check registration status
+async def check_registration_and_execute(update: Update, context: ContextTypes.DEFAULT_TYPE, command_func):
+    """Check if user is registered before executing command"""
+    if not is_allowed_group(update.effective_chat.id):
+        return
+    
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Check if user is registered
+    if not db.is_user_registered(user_id, chat_id):
+        await update.message.reply_text(
+            "⚠️ You need to complete registration to use this command.\n"
+            "Please wait for the registration prompt or contact an admin."
+        )
+        return
+    
+    # Execute the command
+    await command_func(update, context)
+
+# Wrapper functions for commands
+async def set_target_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, set_target)
+
+async def my_targets_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, my_targets)
+
+async def update_progress_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, update_progress)
+
+async def mark_completed_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, mark_completed)
+
+async def view_stats_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, view_stats)
+
+async def export_data_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, export_data)
+
+async def help_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, help_command)
+
+# Original command functions (unchanged from your code)
+async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Please specify your target.\n"
@@ -72,7 +318,6 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     target_text = " ".join(context.args)
     
-    # Create target data
     target_data = {
         "user_id": user_id,
         "username": update.effective_user.username or update.effective_user.first_name,
@@ -84,10 +329,8 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "completed_at": None
     }
     
-    # Save to database
     target_id = db.add_target(target_data)
     
-    # Ask for deadline
     keyboard = [
         [
             InlineKeyboardButton("1 day", callback_data=f"deadline_{target_id}_1"),
@@ -106,7 +349,6 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-# Deadline callback handler
 async def deadline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -126,11 +368,7 @@ async def deadline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✅ Target saved without deadline."
         )
 
-# View my targets
 async def my_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed_group(update.effective_chat.id):
-        return
-    
     user_id = update.effective_user.id
     targets = db.get_user_targets(user_id)
     
@@ -157,11 +395,7 @@ async def my_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(message)
 
-# Update progress
 async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed_group(update.effective_chat.id):
-        return
-    
     if len(context.args) != 2:
         await update.message.reply_text(
             "Usage: /progress <target_id> <percentage>\n"
@@ -189,11 +423,7 @@ async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Target not found or update failed.")
 
-# Mark as completed
 async def mark_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed_group(update.effective_chat.id):
-        return
-    
     if not context.args:
         await update.message.reply_text(
             "Please specify target ID.\n"
@@ -212,11 +442,7 @@ async def mark_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Target not found.")
 
-# View statistics
 async def view_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed_group(update.effective_chat.id):
-        return
-    
     user_id = update.effective_user.id
     stats = db.get_user_stats(user_id)
     
@@ -232,30 +458,20 @@ async def view_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(message)
 
-# Admin: Export all data
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed_group(update.effective_chat.id):
-        return
-    
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("This command is for admins only.")
         return
     
-    # Export data to CSV or JSON
     data = db.export_all_data()
     
-    # In a real implementation, you would create a file and send it
     await update.message.reply_text(
         "📊 Data export initiated.\n"
         f"Total records: {len(data)}\n\n"
         "Note: In production, this would generate and send a file."
     )
 
-# Help command
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed_group(update.effective_chat.id):
-        return
-    
     help_text = (
         "📚 Study Bot Help\n\n"
         "Commands:\n"
@@ -284,6 +500,46 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "An error occurred. Please try again later."
         )
 
+# Admin command to manually register users
+async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to manually register a user"""
+    if not is_allowed_group(update.effective_chat.id):
+        return
+    
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("This command is for admins only.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /registeruser <user_id> or reply to user's message with /registeruser"
+        )
+        return
+    
+    # Check if replying to a message
+    if update.message.reply_to_message:
+        user_id = update.message.reply_to_message.from_user.id
+        username = update.message.reply_to_message.from_user.username
+    else:
+        try:
+            user_id = int(context.args[0])
+            username = context.args[1] if len(context.args) > 1 else "Unknown"
+        except ValueError:
+            await update.message.reply_text("Invalid user ID.")
+            return
+    
+    # Register user
+    success = db.accept_rules(user_id, update.effective_chat.id)
+    
+    if success:
+        # Unmute user
+        await unmute_user(update.effective_chat.id, user_id, context)
+        await update.message.reply_text(
+            f"✅ User {username} (ID: {user_id}) has been registered and unmuted."
+        )
+    else:
+        await update.message.reply_text("Failed to register user.")
+
 # Main function
 def main():
     # Create application
@@ -291,14 +547,20 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("settarget", set_target))
-    application.add_handler(CommandHandler("mytargets", my_targets))
-    application.add_handler(CommandHandler("progress", update_progress))
-    application.add_handler(CommandHandler("completed", mark_completed))
-    application.add_handler(CommandHandler("stats", view_stats))
-    application.add_handler(CommandHandler("export", export_data))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, 
+        new_member_handler
+    ))
+    application.add_handler(CommandHandler("settarget", set_target_wrapper))
+    application.add_handler(CommandHandler("mytargets", my_targets_wrapper))
+    application.add_handler(CommandHandler("progress", update_progress_wrapper))
+    application.add_handler(CommandHandler("completed", mark_completed_wrapper))
+    application.add_handler(CommandHandler("stats", view_stats_wrapper))
+    application.add_handler(CommandHandler("export", export_data_wrapper))
+    application.add_handler(CommandHandler("help", help_command_wrapper))
+    application.add_handler(CommandHandler("registeruser", register_user))
     application.add_handler(CallbackQueryHandler(deadline_callback, pattern="^deadline_"))
+    application.add_handler(CallbackQueryHandler(accept_rules_callback, pattern="^accept_rules_"))
     
     # Add error handler
     application.add_error_handler(error_handler)
