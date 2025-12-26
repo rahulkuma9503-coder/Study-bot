@@ -8,11 +8,11 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, filters, ContextTypes,
-    ConversationHandler
+    CallbackQueryHandler, filters, ContextTypes
 )
 from database import MongoDB
 from flask import Flask, jsonify
+import uuid  # Add this import
 
 # Load environment variables
 load_dotenv()
@@ -408,30 +408,12 @@ async def check_registration_and_execute(update: Update, context: ContextTypes.D
     # Execute the command
     await command_func(update, context)
 
-# Wrapper functions for commands
-async def set_target_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_registration_and_execute(update, context, set_target)
+# Store temporary callback data for deadline buttons
+deadline_callbacks = {}
 
-async def my_targets_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_registration_and_execute(update, context, my_targets)
-
-async def update_progress_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_registration_and_execute(update, context, update_progress)
-
-async def mark_completed_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_registration_and_execute(update, context, mark_completed)
-
-async def view_stats_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_registration_and_execute(update, context, view_stats)
-
-async def export_data_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_registration_and_execute(update, context, export_data)
-
-async def help_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_registration_and_execute(update, context, help_command)
-
-# Original command functions (keep from your code)
+# Set target command - FIXED VERSION
 async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set a new study target - Fixed to handle multiple targets"""
     if not context.args:
         await update.message.reply_text(
             "Please specify your target.\n"
@@ -442,6 +424,7 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     target_text = " ".join(context.args)
     
+    # Create target data
     target_data = {
         "user_id": user_id,
         "username": update.effective_user.username or update.effective_user.first_name,
@@ -453,44 +436,84 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "completed_at": None
     }
     
-    target_id = db.add_target(target_data)
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("1 day", callback_data=f"deadline_{target_id}_1"),
-            InlineKeyboardButton("3 days", callback_data=f"deadline_{target_id}_3"),
-            InlineKeyboardButton("7 days", callback_data=f"deadline_{target_id}_7"),
-        ],
-        [InlineKeyboardButton("No deadline", callback_data=f"deadline_{target_id}_0")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        f"✅ Target set successfully!\n\n"
-        f"📝 Target: {target_text}\n"
-        f"🆔 Target ID: {target_id}\n\n"
-        "Would you like to set a deadline?",
-        reply_markup=reply_markup
-    )
+    # Save to database
+    try:
+        target_id = db.add_target(target_data)
+        
+        if not target_id:
+            await update.message.reply_text("❌ Failed to save target. Please try again.")
+            return
+        
+        # Generate a unique callback ID for this target
+        callback_id = str(uuid.uuid4())[:8]  # Generate unique 8-char ID
+        deadline_callbacks[callback_id] = target_id  # Map callback ID to actual target ID
+        
+        # Ask for deadline with unique callback IDs
+        keyboard = [
+            [
+                InlineKeyboardButton("1 day", callback_data=f"deadline_{callback_id}_1"),
+                InlineKeyboardButton("3 days", callback_data=f"deadline_{callback_id}_3"),
+                InlineKeyboardButton("7 days", callback_data=f"deadline_{callback_id}_7"),
+            ],
+            [InlineKeyboardButton("No deadline", callback_data=f"deadline_{callback_id}_0")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"✅ Target set successfully!\n\n"
+            f"📝 Target: {target_text}\n"
+            f"🆔 Target ID: {target_id[:8]}...\n\n"
+            "Would you like to set a deadline?",
+            reply_markup=reply_markup
+        )
+        
+    except Exception as e:
+        logger.error(f"Error setting target: {e}")
+        await update.message.reply_text(
+            "❌ An error occurred while setting your target. Please try again."
+        )
 
+# Deadline callback handler - FIXED VERSION
 async def deadline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle deadline selection - Fixed to work with callback mapping"""
     query = update.callback_query
     await query.answer()
     
     data = query.data.split('_')
-    target_id = data[1]
+    if len(data) != 3:
+        await query.edit_message_text("❌ Invalid callback data.")
+        return
+    
+    callback_id = data[1]
     days = int(data[2])
+    
+    # Get the actual target ID from our mapping
+    target_id = deadline_callbacks.get(callback_id)
+    
+    if not target_id:
+        await query.edit_message_text("❌ Target not found. Please set the target again.")
+        return
     
     if days > 0:
         deadline = datetime.now() + timedelta(days=days)
-        db.update_target_deadline(target_id, deadline)
-        await query.edit_message_text(
-            text=f"⏰ Deadline set for {days} day(s) from now!"
-        )
+        success = db.update_target_deadline(target_id, deadline)
+        
+        if success:
+            await query.edit_message_text(
+                text=f"⏰ Deadline set for {days} day(s) from now!"
+            )
+        else:
+            await query.edit_message_text(
+                text="❌ Failed to set deadline. Please try again."
+            )
     else:
         await query.edit_message_text(
             text="✅ Target saved without deadline."
         )
+    
+    # Clean up the callback mapping after use
+    if callback_id in deadline_callbacks:
+        del deadline_callbacks[callback_id]
 
 async def my_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -508,7 +531,7 @@ async def my_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += (
             f"{i}. {status_icon} {target['target']}\n"
             f"   📊 Progress: {progress_bar} {target['progress']}%\n"
-            f"   🆔 ID: {target['_id']}\n"
+            f"   🆔 ID: {str(target['_id'])[:8]}...\n"
         )
         
         if target.get('deadline'):
@@ -520,14 +543,16 @@ async def my_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Update target progress - Fixed to handle target ID better"""
     if len(context.args) != 2:
         await update.message.reply_text(
             "Usage: /progress <target_id> <percentage>\n"
-            "Example: /progress abc123 50"
+            "Example: /progress abc123 50\n\n"
+            "Note: You can use partial target ID (first 8 characters)"
         )
         return
     
-    target_id, progress = context.args[0], context.args[1]
+    target_id_partial, progress = context.args[0], context.args[1]
     
     try:
         progress = int(progress)
@@ -537,34 +562,73 @@ async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please enter a valid percentage (0-100).")
         return
     
+    # Get user's targets to find the full ID
+    user_id = update.effective_user.id
+    targets = db.get_user_targets(user_id)
+    
+    # Find target by partial ID
+    target_id = None
+    for target in targets:
+        if str(target['_id']).startswith(target_id_partial):
+            target_id = str(target['_id'])
+            break
+    
+    if not target_id:
+        await update.message.reply_text(
+            f"❌ Target with ID '{target_id_partial}' not found.\n"
+            f"Use /mytargets to see your targets and their IDs."
+        )
+        return
+    
     success = db.update_target_progress(target_id, progress)
     
     if success:
         await update.message.reply_text(
             f"📊 Progress updated to {progress}%!\n"
-            f"Target ID: {target_id}"
+            f"Target ID: {target_id[:8]}..."
         )
     else:
-        await update.message.reply_text("Target not found or update failed.")
+        await update.message.reply_text("❌ Target not found or update failed.")
 
 async def mark_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mark target as completed - Fixed to handle target ID better"""
     if not context.args:
         await update.message.reply_text(
             "Please specify target ID.\n"
-            "Example: /completed abc123"
+            "Example: /completed abc123\n\n"
+            "Note: You can use partial target ID (first 8 characters)"
         )
         return
     
-    target_id = context.args[0]
+    target_id_partial = context.args[0]
+    
+    # Get user's targets to find the full ID
+    user_id = update.effective_user.id
+    targets = db.get_user_targets(user_id)
+    
+    # Find target by partial ID
+    target_id = None
+    for target in targets:
+        if str(target['_id']).startswith(target_id_partial):
+            target_id = str(target['_id'])
+            break
+    
+    if not target_id:
+        await update.message.reply_text(
+            f"❌ Target with ID '{target_id_partial}' not found.\n"
+            f"Use /mytargets to see your targets and their IDs."
+        )
+        return
+    
     success = db.complete_target(target_id)
     
     if success:
         await update.message.reply_text(
             f"🎉 Target marked as completed!\n"
-            f"Target ID: {target_id}"
+            f"Target ID: {target_id[:8]}..."
         )
     else:
-        await update.message.reply_text("Target not found.")
+        await update.message.reply_text("❌ Target not found.")
 
 async def view_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -613,7 +677,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Set realistic targets\n"
         "• Update progress regularly\n"
         "• Celebrate completed targets!\n"
-        "• Use /stats to track your progress"
+        "• Use partial target IDs (first 8 characters) for commands"
     )
     
     await update.message.reply_text(help_text)
@@ -680,12 +744,44 @@ def send_heartbeat():
     """Send periodic heartbeat to keep the bot alive"""
     while True:
         bot_status["last_heartbeat"] = datetime.now()
+        # Clean up old callback mappings (older than 1 hour)
+        global deadline_callbacks
+        current_time = time.time()
+        # We don't store timestamps, but we can clean based on count
+        # If there are too many entries, remove some
+        if len(deadline_callbacks) > 100:
+            # Remove first 50 entries (FIFO)
+            keys = list(deadline_callbacks.keys())[:50]
+            for key in keys:
+                del deadline_callbacks[key]
         time.sleep(300)  # Every 5 minutes
 
 # Start Flask server in a separate thread
 def start_flask():
     """Start Flask server for health checks"""
     app.run(host='0.0.0.0', port=PORT)
+
+# Wrapper functions for commands
+async def set_target_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, set_target)
+
+async def my_targets_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, my_targets)
+
+async def update_progress_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, update_progress)
+
+async def mark_completed_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, mark_completed)
+
+async def view_stats_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, view_stats)
+
+async def export_data_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, export_data)
+
+async def help_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_registration_and_execute(update, context, help_command)
 
 # Main function
 def main():
