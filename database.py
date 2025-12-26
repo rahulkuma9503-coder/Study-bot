@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.errors import PyMongoError
+from pymongo.errors import PyMongoError, DuplicateKeyError
 from bson import ObjectId
 
 class MongoDB:
@@ -15,17 +15,82 @@ class MongoDB:
         self.registrations = self.db.registrations
         self.group_members = self.db.group_members
         
-        # Create indexes
+        # Drop problematic unique index if it exists
+        self._cleanup_problematic_indexes()
+        
+        # Create correct indexes
+        self._create_indexes()
+    
+    def _cleanup_problematic_indexes(self):
+        """Remove any problematic indexes that might cause duplicate key errors"""
+        try:
+            # Get all indexes
+            indexes = list(self.targets.index_information())
+            
+            # Look for problematic indexes
+            for index_name in indexes:
+                # Drop any unique index on user_id and date/deadline
+                if index_name == 'user_id_1_date_-1' or index_name == 'user_id_1_deadline_-1':
+                    try:
+                        self.targets.drop_index(index_name)
+                        print(f"✅ Dropped problematic index: {index_name}")
+                    except Exception as e:
+                        print(f"Note: Could not drop index {index_name}: {e}")
+                
+                # Drop any compound unique index that includes user_id
+                elif '_1' in index_name and index_name != '_id_':
+                    index_info = self.targets.index_information().get(index_name, {})
+                    if index_info.get('unique'):
+                        # Check if it includes user_id
+                        key = index_info.get('key', [])
+                        if any('user_id' in k for k in key):
+                            try:
+                                self.targets.drop_index(index_name)
+                                print(f"✅ Dropped unique index: {index_name}")
+                            except Exception as e:
+                                print(f"Note: Could not drop index {index_name}: {e}")
+        except Exception as e:
+            print(f"Error cleaning up indexes: {e}")
+    
+    def _create_indexes(self):
+        """Create necessary indexes"""
+        # Create non-unique indexes for better query performance
         self.targets.create_index([("user_id", ASCENDING)])
         self.targets.create_index([("status", ASCENDING)])
         self.targets.create_index([("created_at", DESCENDING)])
+        self.targets.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
+        
+        # Create indexes for registrations
         self.registrations.create_index([("user_id", ASCENDING)])
         self.registrations.create_index([("group_id", ASCENDING)])
+        self.registrations.create_index([("user_id", ASCENDING), ("group_id", ASCENDING)])
+        
+        # Create indexes for group members
         self.group_members.create_index([("user_id", ASCENDING), ("group_id", ASCENDING)])
     
     def add_target(self, target_data: Dict) -> str:
         """Add a new study target"""
         try:
+            # Ensure target has a unique identifier for the user
+            target_data["created_at"] = datetime.now()
+            
+            # Add a unique sequence number for this user
+            last_target = self.targets.find_one(
+                {"user_id": target_data["user_id"]},
+                sort=[("sequence_number", DESCENDING)]
+            )
+            
+            if last_target and "sequence_number" in last_target:
+                target_data["sequence_number"] = last_target["sequence_number"] + 1
+            else:
+                target_data["sequence_number"] = 1
+            
+            result = self.targets.insert_one(target_data)
+            return str(result.inserted_id)
+        except DuplicateKeyError as e:
+            print(f"Duplicate key error: {e}")
+            # Retry with a new sequence number
+            target_data["sequence_number"] += 1
             result = self.targets.insert_one(target_data)
             return str(result.inserted_id)
         except Exception as e:
@@ -102,8 +167,6 @@ class MongoDB:
             ]
             
             current_streak = self._calculate_streak(completed_dates)
-            
-            # Calculate best streak
             best_streak = self._calculate_best_streak(completed_dates)
             
             return {
