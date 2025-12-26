@@ -12,11 +12,14 @@ class MongoDB:
         self.targets = self.db.targets
         self.users = self.db.users
         self.stats = self.db.stats
+        self.registrations = self.db.registrations  # New collection for registrations
         
         # Create indexes
         self.targets.create_index([("user_id", ASCENDING)])
         self.targets.create_index([("status", ASCENDING)])
         self.targets.create_index([("created_at", DESCENDING)])
+        self.registrations.create_index([("user_id", ASCENDING)])
+        self.registrations.create_index([("group_id", ASCENDING)])
     
     def add_target(self, target_data: Dict) -> str:
         """Add a new study target"""
@@ -115,6 +118,63 @@ class MongoDB:
                 break
         
         return streak
+    
+    # New registration methods
+    def add_registration(self, user_id: int, group_id: int, username: str) -> str:
+        """Add a new registration request"""
+        registration_data = {
+            "user_id": user_id,
+            "group_id": group_id,
+            "username": username,
+            "status": "pending",  # pending, accepted, rejected
+            "created_at": datetime.now(),
+            "accepted_at": None,
+            "rules_accepted": False
+        }
+        result = self.registrations.insert_one(registration_data)
+        return str(result.inserted_id)
+    
+    def update_registration_status(self, user_id: int, group_id: int, status: str) -> bool:
+        """Update registration status"""
+        try:
+            update_data = {
+                "status": status,
+                "accepted_at": datetime.now() if status == "accepted" else None
+            }
+            result = self.registrations.update_one(
+                {"user_id": user_id, "group_id": group_id},
+                {"$set": update_data}
+            )
+            return result.modified_count > 0
+        except:
+            return False
+    
+    def accept_rules(self, user_id: int, group_id: int) -> bool:
+        """Mark rules as accepted"""
+        try:
+            result = self.registrations.update_one(
+                {"user_id": user_id, "group_id": group_id},
+                {"$set": {
+                    "rules_accepted": True,
+                    "status": "accepted",
+                    "accepted_at": datetime.now()
+                }}
+            )
+            return result.modified_count > 0
+        except:
+            return False
+    
+    def get_registration_status(self, user_id: int, group_id: int) -> Optional[Dict]:
+        """Get registration status for a user in a group"""
+        return self.registrations.find_one({
+            "user_id": user_id, 
+            "group_id": group_id
+        })
+    
+    def is_user_registered(self, user_id: int, group_id: int) -> bool:
+        """Check if user is registered and accepted"""
+        registration = self.get_registration_status(user_id, group_id)
+        return registration and registration.get("status") == "accepted"
     
     def export_all_data(self) -> List[Dict]:
         """Export all data for backup"""
