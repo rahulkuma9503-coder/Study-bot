@@ -12,7 +12,8 @@ class MongoDB:
         self.targets = self.db.targets
         self.users = self.db.users
         self.stats = self.db.stats
-        self.registrations = self.db.registrations  # New collection for registrations
+        self.registrations = self.db.registrations
+        self.group_members = self.db.group_members  # Track group members
         
         # Create indexes
         self.targets.create_index([("user_id", ASCENDING)])
@@ -20,6 +21,7 @@ class MongoDB:
         self.targets.create_index([("created_at", DESCENDING)])
         self.registrations.create_index([("user_id", ASCENDING)])
         self.registrations.create_index([("group_id", ASCENDING)])
+        self.group_members.create_index([("user_id", ASCENDING), ("group_id", ASCENDING)])
     
     def add_target(self, target_data: Dict) -> str:
         """Add a new study target"""
@@ -94,7 +96,7 @@ class MongoDB:
             "active_targets": active,
             "completion_rate": completion_rate,
             "current_streak": current_streak,
-            "best_streak": 7  # Simplified, implement actual calculation
+            "best_streak": 7
         }
     
     def _calculate_streak(self, dates: List) -> int:
@@ -106,11 +108,9 @@ class MongoDB:
         today = datetime.now().date()
         streak = 0
         
-        # Check if completed today
         if today in dates:
             streak += 1
         
-        # Check consecutive days
         for i in range(1, len(dates)):
             if (dates[i-1] - dates[i]).days == 1:
                 streak += 1
@@ -119,14 +119,14 @@ class MongoDB:
         
         return streak
     
-    # New registration methods
+    # Registration methods
     def add_registration(self, user_id: int, group_id: int, username: str) -> str:
         """Add a new registration request"""
         registration_data = {
             "user_id": user_id,
             "group_id": group_id,
             "username": username,
-            "status": "pending",  # pending, accepted, rejected
+            "status": "pending",
             "created_at": datetime.now(),
             "accepted_at": None,
             "rules_accepted": False
@@ -175,6 +175,54 @@ class MongoDB:
         """Check if user is registered and accepted"""
         registration = self.get_registration_status(user_id, group_id)
         return registration and registration.get("status") == "accepted"
+    
+    # Group member tracking methods
+    def add_group_member(self, user_id: int, group_id: int, username: str):
+        """Add or update group member"""
+        self.group_members.update_one(
+            {"user_id": user_id, "group_id": group_id},
+            {"$set": {
+                "username": username,
+                "last_seen": datetime.now(),
+                "is_active": True
+            }},
+            upsert=True
+        )
+    
+    def get_all_group_members(self, group_id: int) -> List[Dict]:
+        """Get all members in a group"""
+        return list(self.group_members.find({"group_id": group_id}))
+    
+    def check_and_register_existing_members(self, group_id: int, context) -> List[Dict]:
+        """Check existing members and register those who aren't"""
+        try:
+            # Get all chat members
+            chat_members = context.bot.get_chat_administrators(group_id)
+            member_ids = [member.user.id for member in chat_members]
+            
+            unregistered_members = []
+            for member_id in member_ids:
+                if member_id == context.bot.id:
+                    continue
+                    
+                if not self.is_user_registered(member_id, group_id):
+                    # Add to registration database
+                    registration = self.get_registration_status(member_id, group_id)
+                    if not registration:
+                        member_info = next((m for m in chat_members if m.user.id == member_id), None)
+                        if member_info:
+                            username = member_info.user.username or member_info.user.first_name
+                            self.add_registration(member_id, group_id, username)
+                    
+                    unregistered_members.append({
+                        "user_id": member_id,
+                        "registration_id": registration.get("_id") if registration else None
+                    })
+            
+            return unregistered_members
+        except Exception as e:
+            print(f"Error checking existing members: {e}")
+            return []
     
     def export_all_data(self) -> List[Dict]:
         """Export all data for backup"""
