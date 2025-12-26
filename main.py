@@ -3,7 +3,7 @@ import logging
 import threading
 import time
 import asyncio
-import schedule
+import uuid
 from typing import Dict, List
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
@@ -14,7 +14,6 @@ from telegram.ext import (
 )
 from database import MongoDB
 from flask import Flask, jsonify
-import uuid
 
 # Load environment variables
 load_dotenv()
@@ -124,7 +123,6 @@ async def send_registration_prompt(chat_id: int, user_id: int, username: str, co
     """Send registration prompt to user"""
     try:
         if not registration_id:
-            # Create new registration
             registration_id = db.add_registration(user_id, chat_id, username)
         
         keyboard = [[
@@ -164,39 +162,92 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_allowed_group(update.effective_chat.id):
         return
     
-    # Check if it's a group chat
     if update.effective_chat.type not in ['group', 'supergroup']:
         return
     
-    # Get new members
     for member in update.message.new_chat_members:
         user_id = member.id
         username = member.username or member.first_name
         
-        # Skip if it's the bot itself
         if member.id == context.bot.id:
             continue
         
-        # Track member in database
         db.add_group_member(user_id, update.effective_chat.id, username)
         
-        # Check if user is already registered
         if db.is_user_registered(user_id, update.effective_chat.id):
             await update.message.reply_text(
                 f"Welcome back, @{username}! You're already registered."
             )
             continue
         
-        # Mute the new member
         await mute_user(update.effective_chat.id, user_id, context, "New member registration required")
         
-        # Send registration prompt
         await send_registration_prompt(
             update.effective_chat.id, 
             user_id, 
             username, 
             context
         )
+
+# Handler for ALL messages - CHECK AND MUTE UNREGISTERED USERS
+async def check_and_mute_unregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check all messages and mute unregistered users"""
+    if not is_allowed_group(update.effective_chat.id):
+        return
+    
+    if update.effective_chat.type not in ['group', 'supergroup']:
+        return
+    
+    # Skip if it's a command (commands are handled separately)
+    if update.message and update.message.text and update.message.text.startswith('/'):
+        return
+    
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    # Skip admin and bot itself
+    if is_admin(str(user_id)) or user_id == context.bot.id:
+        return
+    
+    # Check if user is registered
+    if not db.is_user_registered(user_id, chat_id):
+        # Mute the user
+        await mute_user(chat_id, user_id, context, "Unregistered user tried to send message")
+        
+        # Get or create registration
+        registration = db.get_registration_status(user_id, chat_id)
+        if not registration:
+            registration_id = db.add_registration(user_id, chat_id, username)
+        else:
+            registration_id = str(registration.get('_id', ''))
+        
+        # Send registration prompt
+        keyboard = [[
+            InlineKeyboardButton(
+                "📝 Register Now", 
+                url=f"https://t.me/{context.bot.username}?start=register_{registration_id}"
+            )
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        warning_message = (
+            f"⚠️ @{username}, you are not registered!\n\n"
+            "You have been muted until you complete registration.\n"
+            "Click the button below to register and get unmuted."
+        )
+        
+        await update.message.reply_text(
+            warning_message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+        # Try to delete the user's message
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.error(f"Could not delete message: {e}")
 
 # Command to check and register existing members
 async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,7 +261,6 @@ async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text("🔍 Checking existing members...")
     
-    # Get unregistered members
     unregistered_members = db.check_and_register_existing_members(
         update.effective_chat.id, 
         context
@@ -220,11 +270,9 @@ async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("✅ All members are already registered!")
         return
     
-    # Process each unregistered member
     processed = 0
     for member in unregistered_members:
         try:
-            # Try to get member info
             chat_member = await context.bot.get_chat_member(
                 update.effective_chat.id,
                 member["user_id"]
@@ -232,7 +280,6 @@ async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_T
             
             username = chat_member.user.username or chat_member.user.first_name
             
-            # Mute the member
             await mute_user(
                 update.effective_chat.id, 
                 member["user_id"], 
@@ -240,7 +287,6 @@ async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_T
                 "Existing member registration required"
             )
             
-            # Send registration prompt
             await send_registration_prompt(
                 update.effective_chat.id,
                 member["user_id"],
@@ -250,7 +296,7 @@ async def check_existing_members(update: Update, context: ContextTypes.DEFAULT_T
             )
             
             processed += 1
-            time.sleep(0.5)  # Avoid rate limiting
+            time.sleep(0.5)
             
         except Exception as e:
             logger.error(f"Error processing member {member['user_id']}: {e}")
@@ -268,7 +314,6 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
         today = date.today()
         current_hour = datetime.now().hour
         
-        # Determine notification type based on hour
         notification_types = {
             9: "first",
             12: "second", 
@@ -282,7 +327,6 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"Sending {notification_type} daily reminder at {current_hour}:00")
         
-        # Get users without targets today
         users_without_target = db.get_users_without_target_today(today)
         
         if not users_without_target:
@@ -294,12 +338,10 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
         
         for user in users_without_target:
             try:
-                # Check if notification was already sent to this user today
                 notifications_sent = user.get("notifications_sent", [])
                 if any(n.get("type") == notification_type for n in notifications_sent):
-                    continue  # Skip if already sent this notification type
+                    continue
                 
-                # Send DM reminder
                 message_text = ""
                 if notification_type == "first":
                     message_text = (
@@ -346,20 +388,17 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
                         "This is your last chance! ⚠️"
                     )
                 
-                # Send DM to user
                 await context.bot.send_message(
                     chat_id=user["user_id"],
                     text=message_text,
                     parse_mode='Markdown'
                 )
                 
-                # Record notification in database
                 db.record_notification_sent(user["user_id"], today, notification_type)
                 
                 sent_count += 1
                 logger.info(f"Sent {notification_type} reminder to user {user['user_id']}")
                 
-                # Avoid rate limiting
                 await asyncio.sleep(0.1)
                 
             except Exception as e:
@@ -369,7 +408,6 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"Sent {sent_count} reminders, failed: {failed_count}")
         
-        # If this is the final notification (5 PM), mark users as absent
         if notification_type == "final":
             await mark_absent_users(context, today)
             
@@ -382,7 +420,6 @@ async def mark_absent_users(context: ContextTypes.DEFAULT_TYPE, today: date):
     try:
         logger.info("Marking absent users for today...")
         
-        # Get users without targets today (after final reminder)
         users_without_target = db.get_users_without_target_today(today)
         
         if not users_without_target:
@@ -392,14 +429,12 @@ async def mark_absent_users(context: ContextTypes.DEFAULT_TYPE, today: date):
         absent_count = 0
         for user in users_without_target:
             try:
-                # Mark user as absent
                 db.mark_user_absent(
                     user["user_id"], 
                     today, 
                     "No daily target submitted"
                 )
                 
-                # Send absent notification to user
                 absent_message = (
                     "📋 **Daily Attendance Report**\n\n"
                     "❌ You have been marked as **ABSENT** for today.\n\n"
@@ -419,14 +454,12 @@ async def mark_absent_users(context: ContextTypes.DEFAULT_TYPE, today: date):
                 absent_count += 1
                 logger.info(f"Marked user {user['user_id']} as absent")
                 
-                # Avoid rate limiting
                 await asyncio.sleep(0.1)
                 
             except Exception as e:
                 logger.error(f"Failed to mark user {user['user_id']} as absent: {e}")
                 continue
         
-        # Send summary to admin
         try:
             admin_message = (
                 f"📊 **Daily Attendance Summary**\n\n"
@@ -458,17 +491,14 @@ async def daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     today = date.today()
     
-    # Get user's daily status
     status = db.get_user_daily_status(user_id, today)
     
-    # Get user's targets for today
     user_targets = db.get_user_targets(user_id)
     today_targets = [
         target for target in user_targets 
         if target.get("created_at") and target["created_at"].date() == today
     ]
     
-    # Build status message
     message = f"📊 **Daily Status for {today.strftime('%Y-%m-%d')}**\n\n"
     
     if status["has_target"] or today_targets:
@@ -477,7 +507,7 @@ async def daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if today_targets:
             message += "**Your targets today:**\n"
-            for i, target in enumerate(today_targets[:3], 1):  # Show first 3 targets
+            for i, target in enumerate(today_targets[:3], 1):
                 progress = target.get("progress", 0)
                 message += f"{i}. {target['target'][:50]}... - {progress}%\n"
             
@@ -486,11 +516,10 @@ async def daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         message += "❌ **Status:** NO TARGET YET\n\n"
         
-        # Show notifications sent
         notifications = status.get("notifications_sent", [])
         if notifications:
             message += "**Reminders received:**\n"
-            for note in notifications[-3:]:  # Show last 3 notifications
+            for note in notifications[-3:]:
                 note_time = note.get("sent_at", datetime.now())
                 if isinstance(note_time, str):
                     note_time = datetime.fromisoformat(note_time)
@@ -499,7 +528,6 @@ async def daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if status["marked_absent"]:
             message += f"\n⚠️ **Absent Marked:** {status['absent_reason']}\n"
         else:
-            # Show next reminder time
             current_hour = datetime.now().hour
             next_reminder = None
             
@@ -511,7 +539,6 @@ async def daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if next_reminder:
                 message += f"\n⏰ **Next reminder:** {next_reminder}:00\n"
     
-    # Add instructions
     message += "\n---\n"
     message += "**Commands:**\n"
     message += "• `/settarget <description>` - Set daily target\n"
@@ -532,7 +559,6 @@ async def attendance_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     today = date.today()
     
-    # Get all registered users
     registered_users = list(db.registrations.find(
         {"group_id": int(ALLOWED_GROUP_ID), "status": "accepted"}
     ))
@@ -541,7 +567,6 @@ async def attendance_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No registered users found.")
         return
     
-    # Count attendance
     present_count = 0
     absent_count = 0
     
@@ -551,10 +576,8 @@ async def attendance_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = user["user_id"]
         username = user.get("username", "Unknown")
         
-        # Get user's daily status
         status = db.get_user_daily_status(user_id, today)
         
-        # Check if user has any targets today
         user_targets = db.get_user_targets(user_id)
         has_target_today = any(
             target.get("created_at") and target["created_at"].date() == today
@@ -572,7 +595,6 @@ async def attendance_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         attendance_list.append(f"{status_text} - @{username}")
     
-    # Create report
     report = (
         f"📊 **Daily Attendance Report**\n\n"
         f"**Date:** {today.strftime('%Y-%m-%d')}\n"
@@ -583,14 +605,12 @@ async def attendance_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"**Attendance List:**\n"
     )
     
-    # Add attendance list (limited to first 20 users)
     for i, entry in enumerate(attendance_list[:20], 1):
         report += f"{i}. {entry}\n"
     
     if len(attendance_list) > 20:
         report += f"\n... and {len(attendance_list) - 20} more users\n"
     
-    # Add summary
     report += f"\n**Next reminder:** {NOTIFICATION_TIMES[0]}:00 AM"
     
     await update.message.reply_text(report, parse_mode='Markdown')
@@ -600,11 +620,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
     
-    # Check if it's a registration start
     if context.args and context.args[0].startswith('register_'):
         registration_id = context.args[0].replace('register_', '')
         
-        # Show rules
         rules_message = (
             "📋 **Group Rules Declaration**\n\n"
             "Please read and accept the following rules:\n\n"
@@ -631,12 +649,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Regular start command
     if update.effective_chat.type == 'private':
         welcome_message = (
             f"👋 Hello {user.first_name}!\n\n"
             "I'm the Study Bot. I help manage study targets and group registrations.\n\n"
-            "**Daily Target Reminders:**\n"
+            "**Daily Target System:**\n"
             "• 9 AM: First reminder\n"
             "• 12 PM: Second reminder\n"
             "• 3 PM: Third reminder\n"
@@ -649,7 +666,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/progress - Update target progress\n"
             "/completed - Mark target as completed\n"
             "/stats - View your study statistics\n"
-            "/dailystatus - Check your daily status\n"
+            "/dailystatus - Check your daily attendance status\n"
             "/help - Show help message"
         )
         await update.message.reply_text(welcome_message)
@@ -687,14 +704,11 @@ async def accept_rules_callback(update: Update, context: ContextTypes.DEFAULT_TY
     registration_id = data[2]
     user_id = query.from_user.id
     
-    # Mark rules as accepted in database
     success = db.accept_rules(user_id, int(ALLOWED_GROUP_ID))
     
     if success:
-        # Unmute user in group
         await unmute_user(int(ALLOWED_GROUP_ID), user_id, context)
         
-        # Send confirmation message in private chat
         await query.edit_message_text(
             "✅ **Registration Successful!**\n\n"
             "You have been unmuted in the group.\n"
@@ -707,7 +721,6 @@ async def accept_rules_callback(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode='Markdown'
         )
         
-        # Send welcome message in group
         try:
             await context.bot.send_message(
                 chat_id=int(ALLOWED_GROUP_ID),
@@ -731,22 +744,17 @@ async def check_registration_and_execute(update: Update, context: ContextTypes.D
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     
-    # Check if user is registered
     if not db.is_user_registered(user_id, chat_id):
-        # Get registration status
         registration = db.get_registration_status(user_id, chat_id)
         
-        # If not in registration database, add them
         if not registration:
             username = update.effective_user.username or update.effective_user.first_name
             registration_id = db.add_registration(user_id, chat_id, username)
         else:
             registration_id = str(registration.get('_id', ''))
         
-        # Mute the user if they try to use commands
         await mute_user(chat_id, user_id, context, "Tried to use commands without registration")
         
-        # Send registration prompt
         keyboard = [[
             InlineKeyboardButton(
                 "📝 Register Now", 
@@ -763,15 +771,14 @@ async def check_registration_and_execute(update: Update, context: ContextTypes.D
         )
         return
     
-    # Execute the command
     await command_func(update, context)
 
 # Store temporary callback data for deadline buttons
 deadline_callbacks = {}
 
-# Set target command - FIXED VERSION
+# Set target command
 async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set a new study target - Fixed to handle multiple targets"""
+    """Set a new study target"""
     if not context.args:
         await update.message.reply_text(
             "Please specify your target.\n"
@@ -782,7 +789,6 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     target_text = " ".join(context.args)
     
-    # Create target data
     target_data = {
         "user_id": user_id,
         "username": update.effective_user.username or update.effective_user.first_name,
@@ -794,7 +800,6 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "completed_at": None
     }
     
-    # Save to database
     try:
         target_id = db.add_target(target_data)
         
@@ -802,11 +807,9 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Failed to save target. Please try again.")
             return
         
-        # Generate a unique callback ID for this target
-        callback_id = str(uuid.uuid4())[:8]  # Generate unique 8-char ID
-        deadline_callbacks[callback_id] = target_id  # Map callback ID to actual target ID
+        callback_id = str(uuid.uuid4())[:8]
+        deadline_callbacks[callback_id] = target_id
         
-        # Ask for deadline with unique callback IDs
         keyboard = [
             [
                 InlineKeyboardButton("1 day", callback_data=f"deadline_{callback_id}_1"),
@@ -831,9 +834,9 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ An error occurred while setting your target. Please try again."
         )
 
-# Deadline callback handler - FIXED VERSION
+# Deadline callback handler
 async def deadline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle deadline selection - Fixed to work with callback mapping"""
+    """Handle deadline selection"""
     query = update.callback_query
     await query.answer()
     
@@ -845,7 +848,6 @@ async def deadline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     callback_id = data[1]
     days = int(data[2])
     
-    # Get the actual target ID from our mapping
     target_id = deadline_callbacks.get(callback_id)
     
     if not target_id:
@@ -869,7 +871,6 @@ async def deadline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✅ Target saved without deadline."
         )
     
-    # Clean up the callback mapping after use
     if callback_id in deadline_callbacks:
         del deadline_callbacks[callback_id]
 
@@ -901,7 +902,7 @@ async def my_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Update target progress - Fixed to handle target ID better"""
+    """Update target progress"""
     if len(context.args) != 2:
         await update.message.reply_text(
             "Usage: /progress <target_id> <percentage>\n"
@@ -920,11 +921,9 @@ async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please enter a valid percentage (0-100).")
         return
     
-    # Get user's targets to find the full ID
     user_id = update.effective_user.id
     targets = db.get_user_targets(user_id)
     
-    # Find target by partial ID
     target_id = None
     for target in targets:
         if str(target['_id']).startswith(target_id_partial):
@@ -949,7 +948,7 @@ async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Target not found or update failed.")
 
 async def mark_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mark target as completed - Fixed to handle target ID better"""
+    """Mark target as completed"""
     if not context.args:
         await update.message.reply_text(
             "Please specify target ID.\n"
@@ -960,11 +959,9 @@ async def mark_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     target_id_partial = context.args[0]
     
-    # Get user's targets to find the full ID
     user_id = update.effective_user.id
     targets = db.get_user_targets(user_id)
     
-    # Find target by partial ID
     target_id = None
     for target in targets:
         if str(target['_id']).startswith(target_id_partial):
@@ -992,7 +989,6 @@ async def view_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     stats = db.get_user_stats(user_id)
     
-    # Get daily attendance stats
     today = date.today()
     daily_status = db.get_user_daily_status(user_id, today)
     
@@ -1082,18 +1078,15 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = int(context.args[0])
             username = context.args[1] if len(context.args) > 1 else "Unknown"
         
-        # Check if already registered
         if db.is_user_registered(user_id, update.effective_chat.id):
             await update.message.reply_text(
                 f"✅ User @{username} (ID: {user_id}) is already registered."
             )
             return
         
-        # Register user
         success = db.accept_rules(user_id, update.effective_chat.id)
         
         if success:
-            # Unmute user
             await unmute_user(update.effective_chat.id, user_id, context)
             await update.message.reply_text(
                 f"✅ User @{username} (ID: {user_id}) has been registered and unmuted."
@@ -1115,10 +1108,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-# Scheduler for daily reminders
-def setup_scheduler(application):
-    """Setup the scheduler for daily reminders"""
-    # Create job queue
+# Setup job queue for daily reminders
+def setup_job_queue(application):
+    """Setup job queue for daily reminders"""
     job_queue = application.job_queue
     
     if job_queue:
@@ -1127,39 +1119,25 @@ def setup_scheduler(application):
             job_queue.run_daily(
                 send_daily_reminders,
                 time=datetime.strptime(f"{hour:02d}:00", "%H:%M").time(),
-                days=(0, 1, 2, 3, 4, 5, 6),
-                name=f"daily_reminder_{hour}"
+                days=(0, 1, 2, 3, 4, 5, 6)
             )
             logger.info(f"Scheduled daily reminder at {hour}:00")
         
-        # Schedule a daily reset at midnight
-        job_queue.run_daily(
-            lambda context: logger.info("Daily reset triggered"),
-            time=datetime.strptime("00:00", "%H:%M").time(),
-            days=(0, 1, 2, 3, 4, 5, 6),
-            name="daily_reset"
-        )
-        
-        logger.info("Scheduler setup complete")
+        logger.info("Job queue setup complete")
     else:
-        logger.warning("Job queue not available for scheduler")
+        logger.warning("Job queue not available")
 
 # Heartbeat function
 def send_heartbeat():
     """Send periodic heartbeat to keep the bot alive"""
     while True:
         bot_status["last_heartbeat"] = datetime.now()
-        # Clean up old callback mappings (older than 1 hour)
         global deadline_callbacks
-        current_time = time.time()
-        # We don't store timestamps, but we can clean based on count
-        # If there are too many entries, remove some
         if len(deadline_callbacks) > 100:
-            # Remove first 50 entries (FIFO)
             keys = list(deadline_callbacks.keys())[:50]
             for key in keys:
                 del deadline_callbacks[key]
-        time.sleep(300)  # Every 5 minutes
+        time.sleep(300)
 
 # Start Flask server in a separate thread
 def start_flask():
@@ -1207,26 +1185,26 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Main function
 def main():
-    # Update bot status
     bot_status["is_running"] = True
     bot_status["start_time"] = datetime.now()
     bot_status["last_heartbeat"] = datetime.now()
     
-    # Start heartbeat thread
     heartbeat_thread = threading.Thread(target=send_heartbeat, daemon=True)
     heartbeat_thread.start()
     
-    # Start Flask server in a separate thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     
-    # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Setup scheduler for daily reminders
-    setup_scheduler(application)
+    setup_job_queue(application)
     
-    # Add handlers
+    # Add handlers - CRITICAL: Add message handler for ALL messages first
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
+        check_and_mute_unregistered
+    ))
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(
         filters.StatusUpdate.NEW_CHAT_MEMBERS, 
@@ -1247,14 +1225,13 @@ def main():
     application.add_handler(CallbackQueryHandler(deadline_callback, pattern="^deadline_"))
     application.add_handler(CallbackQueryHandler(accept_rules_callback, pattern="^accept_rules_"))
     
-    # Add error handler
     application.add_error_handler(error_handler)
     
-    # Start the bot
     print("Bot is starting...")
     print(f"Bot status: {bot_status}")
     print(f"Flask server running on port {PORT}")
     print(f"Daily reminders scheduled at: {', '.join(str(h) + ':00' for h in NOTIFICATION_TIMES)}")
+    print("✅ Bot will now mute unregistered users when they send messages!")
     
     try:
         application.run_polling(
